@@ -18,7 +18,7 @@ networks:
 
 services:
   # --- CLIENT rete AX ---
-  client_ax:
+  client_ax:    
     image: ubuntu:22.04
     container_name: client-AX
     networks:
@@ -33,7 +33,7 @@ services:
       - NET_ADMIN # Necessario per modificare la tabella di routing del container
 
   # --- ROUTER A ---
-  router_a:
+  router_a:    
     build: .
     container_name: router-A
     networks:

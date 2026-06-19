@@ -10,5 +10,5 @@ RUN make
 FROM ubuntu:22.04
 RUN apt-get update && apt-get install -y iputils-ping iproute2 tcpdump net-tools
 WORKDIR /app
-COPY --from=builder /app/rip_router .
+COPY --from=builder /app/rip-in-c .
 CMD ["./rip-in-c"]
