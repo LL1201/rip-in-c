@@ -36,6 +36,9 @@ void process_rip_packet(struct rip_packet *pkt, const char *sender_ip)
     else if (pkt->command == 2)
     {
         printf("Received an Update from %s. Checking routes...\n", sender_ip);
+        struct in_addr addr;
+        addr.s_addr = pkt->entries[0].ip_address;
+        printf("Network received: %s\n", inet_ntoa(addr));
 
         // Example logic for kernel interaction (simplified Bellman-Ford algorithm)
         /*
