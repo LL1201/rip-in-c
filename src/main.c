@@ -11,6 +11,8 @@
 
 int main()
 {
+    setvbuf(stdout, NULL, _IONBF, 0); // Disable buffering for stdout to show logs with docker
+
     printf("RIPinC Daemon starting...\n");
 
     // 1. Initialization (config parsing will be added later)
