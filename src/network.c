@@ -2,7 +2,7 @@
 #define _BSD_SOURCE
 
 #include "network.h"
-#include "rip-protocol-structures.h"
+#include "rip-protocol-specs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,19 +12,11 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 
-#define MAX_NETWORKS 10
 #define CONFIG_FILE "/app/router.conf"
 
-// Structure to hold network CIDR
-struct network_config
-{
-    uint32_t network; // Network address
-    uint32_t netmask; // Network mask
-    char interface_name[IF_NAMESIZE];
-};
-
-static struct network_config networks[MAX_NETWORKS];
-static int num_networks = 0;
+// Global network configuration (defined in header, declared here)
+struct network_config networks[MAX_NETWORKS];
+int num_networks = 0;
 
 // Parse della notazione CIDR nel file di config
 static void parse_cidr(const char *cidr, uint32_t *network, uint32_t *netmask)
@@ -46,7 +38,7 @@ static void parse_cidr(const char *cidr, uint32_t *network, uint32_t *netmask)
 
     // Parse prefix length and convert to netmask
     int prefix = atoi(slash + 1);
-    *netmask = htonl((0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF);
+    *netmask = htonl(~((1 << (32 - prefix)) - 1));
 }
 
 // Check if an IP address belongs to a network

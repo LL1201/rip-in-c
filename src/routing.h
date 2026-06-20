@@ -3,9 +3,9 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
-#include "rip-protocol-structures.h"
+#include "rip-protocol-specs.h"
 
-void send_my_routes(int sock);
-void process_rip_packet(struct rip_packet *pkt, const char *sender_ip);
+void send_routes(int sock);
+void process_rip_packet(struct rip_packet *pkt, int bytes_received, const char *sender_ip);
 
 #endif

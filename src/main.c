@@ -4,7 +4,7 @@
 #include <sys/select.h>
 #include <arpa/inet.h>
 #include "network.h"
-#include "rip-protocol-structures.h"
+#include "rip-protocol-specs.h"
 #include "routing.h"
 
 #define UPDATE_TIMER 30 // Seconds between each update
@@ -24,12 +24,16 @@ int main()
 
     // Variables for select()
     fd_set readfds;
-    struct timeval tv;
+    struct timeval tv, now, next_update;
 
     // Buffer to receive packets
     struct rip_packet incoming_packet;
     struct sockaddr_in sender_addr;
     socklen_t sender_len = sizeof(sender_addr);
+
+    gettimeofday(&now, NULL);
+    next_update = now;
+    next_update.tv_sec += UPDATE_TIMER;
 
     // 3. Daemon infinite loop
     while (1)
@@ -37,11 +41,41 @@ int main()
         FD_ZERO(&readfds);
         FD_SET(sock, &readfds);
 
-        // Set timer for next update
-        tv.tv_sec = UPDATE_TIMER;
-        tv.tv_usec = 0;
+        gettimeofday(&now, NULL);
 
-        // select() waits: either a packet arrives or the timer expires
+        // 2. Controllo primario: è arrivato il momento di aggiornare?
+        // Se il tempo attuale ha superato o raggiunto il 'next_update'
+        if (now.tv_sec > next_update.tv_sec ||
+            (now.tv_sec == next_update.tv_sec && now.tv_usec >= next_update.tv_usec))
+        {
+            printf("[TIMER] 30 seconds elapsed. Sending RIP update...\n");
+            send_routes(sock); // Invia l'update
+
+            // Ricalcola il prossimo traguardo tra 30 secondi a partire da ORA
+            gettimeofday(&now, NULL);
+            next_update = now;
+            next_update.tv_sec += UPDATE_TIMER;
+        }
+
+        // 3. Calcola il tempo rimanente effettivo per la select
+        tv.tv_sec = next_update.tv_sec - now.tv_sec;
+        tv.tv_usec = next_update.tv_usec - now.tv_usec;
+
+        // Gestione del prestito (se i microsecondi sono negativi)
+        if (tv.tv_usec < 0)
+        {
+            tv.tv_sec -= 1;
+            tv.tv_usec += 1000000;
+        }
+
+        // Se per qualche motivo strano il timer è negativo, mettilo a 0 per non far crashare select
+        if (tv.tv_sec < 0)
+        {
+            tv.tv_sec = 0;
+            tv.tv_usec = 0;
+        }
+
+        // select() aspetta: o arriva un pacchetto o finisce il TEMPO RIMANENTE
         int activity = select(sock + 1, &readfds, NULL, NULL, &tv);
 
         if (activity < 0)
@@ -49,31 +83,27 @@ int main()
             perror("Error in select");
             break;
         }
-        else if (activity == 0)
+        else if (activity > 0 && FD_ISSET(sock, &readfds))
         {
-            // TIMER EXPIRED: Time to send our routing table to neighbors!
-            printf("[TIMER] 30 seconds elapsed. Sending RIP update...\n");
-            send_my_routes(sock); // Function defined in routing.c
-        }
-        else
-        {
-            // A PACKET ARRIVED: Someone sent us their routes
-            if (FD_ISSET(sock, &readfds))
+            // UN PACCHETTO È ARRIVATO!
+            // Il timer in 'next_update' non viene toccato, quindi al prossimo giro
+            // la select aspetterà per i secondi RIMANENTI, non per altri 30 secondi interi.
+
+            int bytes_received = recvfrom(sock, &incoming_packet, sizeof(struct rip_packet), 0,
+                                          (struct sockaddr *)&sender_addr, &sender_len);
+            if (bytes_received > 0)
             {
-                int bytes_received = recvfrom(sock, &incoming_packet, sizeof(struct rip_packet), 0,
-                                              (struct sockaddr *)&sender_addr, &sender_len);
-                if (bytes_received > 0)
-                {
-                    char sender_ip[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &(sender_addr.sin_addr), sender_ip, INET_ADDRSTRLEN);
+                char sender_ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &(sender_addr.sin_addr), sender_ip, INET_ADDRSTRLEN);
 
-                    printf("[RECV] Received %d bytes from %s\n", bytes_received, sender_ip);
+                printf("[RECV] Received %d bytes from %s\n", bytes_received, sender_ip);
 
-                    // Pass packet to routing logic for analysis
-                    process_rip_packet(&incoming_packet, sender_ip);
-                }
+                process_rip_packet(&incoming_packet, bytes_received, sender_ip);
             }
         }
+        // Nota: Non serve più gestire "else if (activity == 0)" qui!
+        // Se la select scade (0), il loop si riavvia semplicemente.
+        // L'if all'inizio del loop (now > next_update) se ne accorgerà e farà scattare send_routes().
     }
 
     close(sock);
