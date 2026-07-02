@@ -14,7 +14,7 @@
 
 #define CONFIG_FILE "/app/router.conf"
 
-// Global network configuration (defined in header, declared here)
+// Global network configuration
 struct network_config networks[MAX_NETWORKS];
 int num_networks = 0;
 
@@ -42,7 +42,7 @@ static void parse_cidr(const char *cidr, uint32_t *network, uint32_t *netmask)
 }
 
 // Check if an IP address belongs to a network
-static int ip_in_network(uint32_t ip, uint32_t network, uint32_t netmask)
+int ip_in_network(uint32_t ip, uint32_t network, uint32_t netmask)
 {
     return (ip & netmask) == (network & netmask);
 }
@@ -81,7 +81,7 @@ int create_rip_socket()
 
     if (num_networks == 0)
     {
-        fprintf(stderr, "Error: No networks configured in %s\n", CONFIG_FILE);
+        fprintf(stderr, "Error: No networks configured in RIP Database");
         exit(1);
     }
 
@@ -148,6 +148,7 @@ int create_rip_socket()
                 {
                     printf("RIP enabled on: %s (%s)\n", ifa->ifa_name, inet_ntoa(addr->sin_addr));
                     strncpy(networks[i].interface_name, ifa->ifa_name, IF_NAMESIZE - 1);
+                    networks[i].local_ip = interface_ip;
                 }
                 break;
             }
@@ -163,70 +164,19 @@ int create_rip_socket()
     return sock;
 }
 
-void send_rip_packet(int sock, struct rip_packet *packet, int num_entries)
+void send_rip_packet(int sock, struct rip_packet *pkt, int num_entries, struct sockaddr_in *dest, struct in_addr *out_iface_ip)
 {
-    if (num_entries > 25)
+    int packet_size = 4 + (num_entries * sizeof(struct rip_rte));
+
+    // Se passiamo un IP di interfaccia e l'indirizzo di destinazione è multicast, bindiamo l'uscita
+    if (out_iface_ip != NULL && dest->sin_addr.s_addr == inet_addr(RIP_MULTICAST_ADDR))
     {
-        fprintf(stderr, "Error: too many entries (%d > 25)\n", num_entries);
-        return;
+        setsockopt(sock, IPPROTO_IP, IP_MULTICAST_IF, out_iface_ip, sizeof(struct in_addr));
     }
 
-    struct sockaddr_in dest_addr;
-    memset(&dest_addr, 0, sizeof(dest_addr));
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(RIP_PORT);
-    dest_addr.sin_addr.s_addr = inet_addr(RIP_MULTICAST_ADDR);
-
-    // Send RIP packet on all configured network interfaces
-    for (int i = 0; i < num_networks; i++)
+    ssize_t sent = sendto(sock, pkt, packet_size, 0, (struct sockaddr *)dest, sizeof(struct sockaddr_in));
+    if (sent < 0)
     {
-        if (networks[i].interface_name[0] == '\0')
-            continue; // Interface was not successfully enabled
-
-        struct in_addr interface_addr;
-        interface_addr.s_addr = 0;
-
-        // Get the actual interface address
-        struct ifaddrs *ifaddr, *ifa;
-        if (getifaddrs(&ifaddr) < 0)
-            continue;
-
-        for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
-        {
-            if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET)
-                continue;
-
-            if (strcmp(ifa->ifa_name, networks[i].interface_name) == 0)
-            {
-                struct sockaddr_in *addr = (struct sockaddr_in *)ifa->ifa_addr;
-                interface_addr = addr->sin_addr;
-                break;
-            }
-        }
-
-        freeifaddrs(ifaddr);
-
-        if (interface_addr.s_addr == 0)
-            continue;
-
-        // Set which interface to send multicast on
-        if (setsockopt(sock, IPPROTO_IP, IP_MULTICAST_IF, &interface_addr, sizeof(interface_addr)) < 0)
-        {
-            fprintf(stderr, "Warning: Could not set multicast interface for %s\n", networks[i].interface_name);
-            continue;
-        }
-
-        // Send RIP packet to Multicast group
-        ssize_t sent = sendto(sock, packet, sizeof(struct rip_packet), 0,
-                              (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-
-        if (sent < 0)
-        {
-            fprintf(stderr, "Error sending RIP packet on %s\n", networks[i].interface_name);
-        }
-        else
-        {
-            printf("[SEND] RIP update sent on: %s\n", networks[i].interface_name);
-        }
+        perror("[ERROR] sendto failed");
     }
 }

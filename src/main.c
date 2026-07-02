@@ -2,25 +2,39 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/select.h>
+#include <sys/time.h>
 #include <arpa/inet.h>
 #include "network.h"
 #include "rip-protocol-specs.h"
 #include "routing.h"
 
-#define UPDATE_TIMER 30 // Seconds between each update
+#define BASE_UPDATE_TIMER 30
+
+// funzione helper per calcolare il timer con jitter (30 sec +/- 5)
+int get_jittered_timer()
+{
+    // rand() % 11 genera un numero tra 0 e 10.
+    // sottraendo 5, otteniamo un numero tra -5 e +5.
+    int offset = (rand() % 11) - 5;
+    return BASE_UPDATE_TIMER + offset;
+}
 
 int main()
 {
-    setvbuf(stdout, NULL, _IONBF, 0); // Disable buffering for stdout to show logs with docker
+    // buffering disabilitato per leggere i log tramite docker logs
+    setvbuf(stdout, NULL, _IONBF, 0);
 
     printf("RIPinC Daemon starting...\n");
 
-    // 1. Initialization (config parsing will be added later)
-    // init_routing_table();
-
-    // 2. Create UDP Multicast socket
+    // Create UDP Multicast socket
     int sock = create_rip_socket();
     printf("Socket created. Listening on %s:%d\n", RIP_MULTICAST_ADDR, RIP_PORT);
+
+    srand(time(NULL) ^ getpid());
+
+    // Inizializzazione del rip database con le reti e interfacce individuate nella create socket
+    init_rip_database();
+    print_routing_table();
 
     // Variables for select()
     fd_set readfds;
@@ -31,11 +45,12 @@ int main()
     struct sockaddr_in sender_addr;
     socklen_t sender_len = sizeof(sender_addr);
 
+    // next update contiene il timestamp del momento in cui l'update è da inviare
     gettimeofday(&now, NULL);
     next_update = now;
-    next_update.tv_sec += UPDATE_TIMER;
+    next_update.tv_sec += get_jittered_timer();
 
-    // 3. Daemon infinite loop
+    // TODO vedere il multithreading
     while (1)
     {
         FD_ZERO(&readfds);
@@ -43,39 +58,33 @@ int main()
 
         gettimeofday(&now, NULL);
 
-        // 2. Controllo primario: è arrivato il momento di aggiornare?
-        // Se il tempo attuale ha superato o raggiunto il 'next_update'
+        // Invia l'unsolicited update solo se
+        // l'attuale timestamp è maggiore di quello del next update (sono passati i secondi necessari)
+        // oppure i secondi sono uguali e i microsecondi maggiori o uguali (per essere precisi)
         if (now.tv_sec > next_update.tv_sec ||
             (now.tv_sec == next_update.tv_sec && now.tv_usec >= next_update.tv_usec))
         {
-            printf("[TIMER] 30 seconds elapsed. Sending RIP update...\n");
-            send_routes(sock); // Invia l'update
+            printf("[TIMER] Sending RIP update...\n");
+            send_unsolicited_update(sock);
 
-            // Ricalcola il prossimo traguardo tra 30 secondi a partire da ORA
+            // ricalcolo timer
             gettimeofday(&now, NULL);
             next_update = now;
-            next_update.tv_sec += UPDATE_TIMER;
+
+            next_update.tv_sec += get_jittered_timer();
         }
 
-        // 3. Calcola il tempo rimanente effettivo per la select
-        tv.tv_sec = next_update.tv_sec - now.tv_sec;
-        tv.tv_usec = next_update.tv_usec - now.tv_usec;
+        // calcola il tempo rimanente effettivo per la select
+        // timersub fa tv = next_update - now
+        timersub(&next_update, &now, &tv);
 
-        // Gestione del prestito (se i microsecondi sono negativi)
-        if (tv.tv_usec < 0)
-        {
-            tv.tv_sec -= 1;
-            tv.tv_usec += 1000000;
-        }
-
-        // Se per qualche motivo strano il timer è negativo, mettilo a 0 per non far crashare select
+        // se prima della select next_update è già stato superato evitiamo che la select tuoni avendo valori negativi
         if (tv.tv_sec < 0)
         {
             tv.tv_sec = 0;
             tv.tv_usec = 0;
         }
 
-        // select() aspetta: o arriva un pacchetto o finisce il TEMPO RIMANENTE
         int activity = select(sock + 1, &readfds, NULL, NULL, &tv);
 
         if (activity < 0)
@@ -85,9 +94,9 @@ int main()
         }
         else if (activity > 0 && FD_ISSET(sock, &readfds))
         {
-            // UN PACCHETTO È ARRIVATO!
-            // Il timer in 'next_update' non viene toccato, quindi al prossimo giro
-            // la select aspetterà per i secondi RIMANENTI, non per altri 30 secondi interi.
+            // è arrivato un pacchetto
+            // Il timer in next_update non viene toccato
+            // la select aspetterà per i secondi rimanenti, non per altri 30 secondi interi.
 
             int bytes_received = recvfrom(sock, &incoming_packet, sizeof(struct rip_packet), 0,
                                           (struct sockaddr *)&sender_addr, &sender_len);
@@ -98,12 +107,10 @@ int main()
 
                 printf("[RECV] Received %d bytes from %s\n", bytes_received, sender_ip);
 
-                process_rip_packet(&incoming_packet, bytes_received, sender_ip);
+                process_rip_packet(sock, &incoming_packet, bytes_received, &sender_addr);
             }
         }
-        // Nota: Non serve più gestire "else if (activity == 0)" qui!
-        // Se la select scade (0), il loop si riavvia semplicemente.
-        // L'if all'inizio del loop (now > next_update) se ne accorgerà e farà scattare send_routes().
+        // if (activity == 0) il loop si riavvia
     }
 
     close(sock);

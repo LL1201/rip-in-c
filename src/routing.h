@@ -3,9 +3,47 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <time.h>
+#include <net/if.h>
 #include "rip-protocol-specs.h"
 
-void send_routes(int sock);
-void process_rip_packet(struct rip_packet *pkt, int bytes_received, const char *sender_ip);
+#define MAX_ROUTING_TABLE_ENTRIES 100
+#define ROUTE_TIMEOUT 180 // 3 minuti - route expiration time in seconds
+
+// Internal routing table entry for RIP
+struct route_entry
+{
+    uint32_t network;                 // Network address
+    uint32_t subnet_mask;             // Network mask
+    uint32_t next_hop;                // Next hop IP address
+    uint32_t metric;                  // Cost (RIP metric)
+    char interface_name[IF_NAMESIZE]; // Outgoing interface
+    time_t last_update;               // Timestamp of last update (for expiration)
+    int is_local;                     // 1 if directly connected, 0 if learned from RIP
+};
+
+// Routing table structure
+struct routing_table
+{
+    struct route_entry entries[MAX_ROUTING_TABLE_ENTRIES];
+    int num_entries;
+};
+
+// Rip routing table
+extern struct routing_table rip_database;
+
+void send_unsolicited_update(int sock);
+
+void init_rip_database(void);
+void send_full_table_unicast(int sock, struct sockaddr_in *requester_addr, const char *request_iface_name);
+void process_rip_packet(int sock, struct rip_packet *pkt, int bytes_received, struct sockaddr_in *sender_addr);
+
+// Routing table management functions
+void init_rip_database(void);
+void add_route(uint32_t network, uint32_t subnet_mask, uint32_t next_hop, uint32_t metric, const char *interface_name, int is_local);
+// void update_route(uint32_t network, uint32_t subnet_mask, uint32_t next_hop, uint32_t metric);
+// void remove_route(uint32_t network, uint32_t subnet_mask);
+struct route_entry *find_route(uint32_t network, uint32_t subnet_mask);
+void print_routing_table(void);
 
 #endif
