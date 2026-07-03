@@ -1,5 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <signal.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/select.h>
 #include <sys/time.h>
@@ -8,7 +11,15 @@
 #include "rip-protocol-specs.h"
 #include "routing.h"
 
-#define BASE_UPDATE_TIMER 30
+#define BASE_UPDATE_TIMER 5
+
+static volatile sig_atomic_t shutdown_requested = 0;
+
+static void handle_shutdown_signal(int signal_number)
+{
+    (void)signal_number;
+    shutdown_requested = 1;
+}
 
 // funzione helper per calcolare il timer con jitter (30 sec +/- 5)
 int get_jittered_timer()
@@ -23,6 +34,13 @@ int main()
 {
     // buffering disabilitato per leggere i log tramite docker logs
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = handle_shutdown_signal;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, NULL);
+    sigaction(SIGTERM, &action, NULL);
 
     printf("RIPinC Daemon starting...\n");
 
@@ -53,6 +71,12 @@ int main()
     // TODO vedere il multithreading
     while (1)
     {
+        if (shutdown_requested)
+            break;
+
+        expire_timed_out_routes(sock);
+        refresh_local_interface_routes(sock);
+
         FD_ZERO(&readfds);
         FD_SET(sock, &readfds);
 
@@ -89,6 +113,9 @@ int main()
 
         if (activity < 0)
         {
+            if (errno == EINTR && shutdown_requested)
+                break;
+
             perror("Error in select");
             break;
         }
@@ -112,6 +139,8 @@ int main()
         }
         // if (activity == 0) il loop si riavvia
     }
+
+    graceful_shutdown(sock);
 
     close(sock);
     return 0;

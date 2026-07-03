@@ -11,6 +11,14 @@ networks:
     ipam:
       config:
         - subnet: 10.12.2.0/24
+  rip-in-c-ac-net:
+    ipam:
+      config:
+        - subnet: 10.12.4.0/24
+  rip-in-c-ac2-net:
+    ipam:
+      config:
+        - subnet: 10.12.5.0/24
   rip-in-c-cy-net:
     ipam:
       config:
@@ -25,7 +33,7 @@ services:
       rip-in-c-ax-net:
         ipv4_address: 10.12.10.99
     command: >
-      bash -c "apt-get update && apt-get install -y iputils-ping iproute2 &&
+      bash -c "apt-get update && apt-get install -y traceroute iputils-ping iproute2 &&
       ip route del default &&
       ip route add default via 10.12.10.254 &&
       tail -f /dev/null"
@@ -41,6 +49,10 @@ services:
         ipv4_address: 10.12.10.254
       rip-in-c-ab-net:
         ipv4_address: 10.12.1.3
+      rip-in-c-ac-net:
+        ipv4_address: 10.12.4.2
+      rip-in-c-ac2-net:
+        ipv4_address: 10.12.5.2
     volumes:
       - ./configs/router-A.conf:/app/router.conf
     sysctls:
@@ -73,6 +85,10 @@ services:
         ipv4_address: 10.12.2.3
       rip-in-c-cy-net:
         ipv4_address: 10.12.20.254
+      rip-in-c-ac-net:
+        ipv4_address: 10.12.4.3
+      rip-in-c-ac2-net:
+        ipv4_address: 10.12.5.3
     volumes:
       - ./configs/router-C.conf:/app/router.conf
     sysctls:
@@ -88,7 +104,7 @@ services:
       rip-in-c-cy-net:
         ipv4_address: 10.12.20.99
     command: >
-      bash -c "apt-get update && apt-get install -y iputils-ping iproute2 &&
+      bash -c "apt-get update && apt-get install -y iputils-ping traceroute iproute2 &&
       ip route del default &&
       ip route add default via 10.12.20.254 &&
       tail -f /dev/null"

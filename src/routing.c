@@ -1,3 +1,6 @@
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
@@ -20,11 +23,13 @@ static int mask_to_prefix(uint32_t mask)
 {
     int prefix = 0;
     uint32_t m = ntohl(mask);
+
     while (m & 0x80000000)
     {
         prefix++;
         m <<= 1;
     }
+
     return prefix;
 }
 
@@ -40,6 +45,70 @@ struct route_entry *find_route(uint32_t network, uint32_t subnet_mask)
         }
     }
     return NULL; // Rotta non trovata
+}
+
+static void remove_route_at_index(int index)
+{
+    for (int i = index; i < rip_database.num_entries - 1; i++)
+    {
+        rip_database.entries[i] = rip_database.entries[i + 1];
+    }
+
+    rip_database.num_entries--;
+}
+
+static void remove_kernel_route(struct route_entry *route)
+{
+    struct in_addr net_addr;
+    char net_str[INET_ADDRSTRLEN];
+
+    net_addr.s_addr = route->network;
+    inet_ntop(AF_INET, &net_addr, net_str, INET_ADDRSTRLEN);
+
+    int prefix = mask_to_prefix(route->subnet_mask);
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "ip route del %s/%d", net_str, prefix);
+    printf("[KERNEL] Removing route during shutdown: %s\n", cmd);
+    system(cmd);
+}
+
+static int interface_is_up(const char *interface_name, struct in_addr *interface_ip)
+{
+    struct ifaddrs *ifaddr, *ifa;
+
+    if (getifaddrs(&ifaddr) < 0)
+    {
+        perror("getifaddrs() failed");
+        return 0;
+    }
+
+    int is_up = 0;
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
+    {
+        if (ifa->ifa_addr == NULL)
+            continue;
+
+        if (strcmp(ifa->ifa_name, interface_name) != 0)
+            continue;
+
+        if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK))
+            continue;
+
+        if (ifa->ifa_addr->sa_family == AF_INET)
+        {
+            if (interface_ip != NULL)
+            {
+                struct sockaddr_in *addr = (struct sockaddr_in *)ifa->ifa_addr;
+                interface_ip->s_addr = addr->sin_addr.s_addr;
+            }
+
+            is_up = 1;
+            break;
+        }
+    }
+
+    freeifaddrs(ifaddr);
+    return is_up;
 }
 
 static void send_routing_table(int sock, struct sockaddr_in *dest, const char *split_horizon_iface, struct in_addr *out_iface_ip)
@@ -107,12 +176,217 @@ void send_unsolicited_update(int sock)
             continue;
 
         struct in_addr iface_ip;
-        iface_ip.s_addr = networks[iface_idx].local_ip;
+        if (!interface_is_up(networks[iface_idx].interface_name, &iface_ip))
+        {
+            printf("[SEND] Skipping down interface %s\n", networks[iface_idx].interface_name);
+            continue;
+        }
 
         send_routing_table(sock, &dest, networks[iface_idx].interface_name, &iface_ip);
 
         printf("[SEND] Periodic Update sent on interface %s\n", networks[iface_idx].interface_name);
     }
+}
+
+int refresh_local_interface_routes(int sock)
+{
+    int table_changed = 0;
+    time_t now = time(NULL);
+
+    for (int iface_idx = 0; iface_idx < num_networks; iface_idx++)
+    {
+        if (networks[iface_idx].interface_name[0] == '\0')
+            continue;
+
+        struct in_addr current_ip;
+        int iface_up = interface_is_up(networks[iface_idx].interface_name, &current_ip);
+        struct route_entry *route = find_route(networks[iface_idx].network, networks[iface_idx].netmask);
+
+        if (route == NULL || !route->is_local)
+            continue;
+
+        if (iface_up)
+        {
+            networks[iface_idx].local_ip = current_ip.s_addr;
+
+            if (route->metric != 1 || route->invalid_since != 0)
+            {
+                route->metric = 1;
+                route->invalid_since = 0;
+                route->last_update = now;
+                table_changed = 1;
+
+                struct in_addr net_addr;
+                char net_str[INET_ADDRSTRLEN];
+                int prefix = mask_to_prefix(route->subnet_mask);
+                char cmd[256];
+
+                net_addr.s_addr = route->network;
+                inet_ntop(AF_INET, &net_addr, net_str, INET_ADDRSTRLEN);
+                snprintf(cmd, sizeof(cmd), "ip route replace %s/%d via %s metric 1", net_str, prefix, inet_ntoa(current_ip));
+                printf("[LINK] Interface %s is up again, restoring route %s/%d\n", networks[iface_idx].interface_name, net_str, prefix);
+                printf("[KERNEL] Executing: %s\n", cmd);
+                system(cmd);
+            }
+        }
+        else
+        {
+            for (int route_idx = 0; route_idx < rip_database.num_entries; route_idx++)
+            {
+                struct route_entry *dependent_route = &rip_database.entries[route_idx];
+
+                if (dependent_route->is_local)
+                    continue;
+
+                if (dependent_route->metric >= 16)
+                    continue;
+
+                if (!ip_in_network(dependent_route->next_hop, networks[iface_idx].network, networks[iface_idx].netmask))
+                    continue;
+
+                remove_kernel_route(dependent_route);
+                dependent_route->metric = 16;
+                dependent_route->invalid_since = now;
+                dependent_route->last_update = now;
+                table_changed = 1;
+
+                struct in_addr dependent_net_addr;
+                char dependent_net_str[INET_ADDRSTRLEN];
+                dependent_net_addr.s_addr = dependent_route->network;
+                inet_ntop(AF_INET, &dependent_net_addr, dependent_net_str, INET_ADDRSTRLEN);
+                printf("[LINK] Interface %s is down, poisoning dependent route %s\n",
+                       networks[iface_idx].interface_name, dependent_net_str);
+            }
+
+            if (route->metric != 16)
+            {
+                struct in_addr net_addr;
+                char net_str[INET_ADDRSTRLEN];
+                int prefix = mask_to_prefix(route->subnet_mask);
+                char cmd[256];
+
+                net_addr.s_addr = route->network;
+                inet_ntop(AF_INET, &net_addr, net_str, INET_ADDRSTRLEN);
+
+                route->metric = 16;
+                route->invalid_since = now;
+                route->last_update = now;
+                table_changed = 1;
+
+                snprintf(cmd, sizeof(cmd), "ip route del %s/%d", net_str, prefix);
+                printf("[LINK] Interface %s is down, poisoning local route %s/%d\n", networks[iface_idx].interface_name, net_str, prefix);
+                printf("[KERNEL] Executing: %s\n", cmd);
+                system(cmd);
+            }
+        }
+    }
+
+    if (table_changed)
+    {
+        print_routing_table();
+        send_unsolicited_update(sock);
+    }
+
+    return table_changed;
+}
+
+int expire_timed_out_routes(int sock)
+{
+    time_t now = time(NULL);
+    int table_changed = 0;
+
+    for (int i = rip_database.num_entries - 1; i >= 0; i--)
+    {
+        struct route_entry *route = &rip_database.entries[i];
+
+        if (route->is_local || route->metric < 16 || route->invalid_since == 0)
+            continue;
+
+        if (difftime(now, route->invalid_since) >= GARBAGE_COLLECTION_TIMER)
+        {
+            struct in_addr net_addr;
+            char net_str[INET_ADDRSTRLEN];
+
+            net_addr.s_addr = route->network;
+            inet_ntop(AF_INET, &net_addr, net_str, INET_ADDRSTRLEN);
+
+            int prefix = mask_to_prefix(route->subnet_mask);
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd), "ip route del %s/%d", net_str, prefix);
+            printf("[GC] Removing expired route %s/%d from database\n", net_str, prefix);
+            printf("[KERNEL] Garbage collection executing: %s\n", cmd);
+            system(cmd);
+
+            remove_route_at_index(i);
+            table_changed = 1;
+        }
+    }
+
+    for (int i = 0; i < rip_database.num_entries; i++)
+    {
+        struct route_entry *route = &rip_database.entries[i];
+
+        if (route->is_local || route->metric >= 16)
+            continue;
+
+        if (difftime(now, route->last_update) >= ROUTE_TIMEOUT)
+        {
+            struct in_addr net_addr;
+            char net_str[INET_ADDRSTRLEN];
+
+            net_addr.s_addr = route->network;
+            inet_ntop(AF_INET, &net_addr, net_str, INET_ADDRSTRLEN);
+
+            route->metric = 16;
+            route->invalid_since = now;
+            table_changed = 1;
+
+            int prefix = mask_to_prefix(route->subnet_mask);
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd), "ip route del %s/%d", net_str, prefix);
+            printf("[TIMER] Route expired for %s/%d, poisoning metric to 16\n", net_str, prefix);
+            printf("[KERNEL] Route expired, executing: %s\n", cmd);
+            system(cmd);
+        }
+    }
+
+    if (table_changed)
+    {
+        print_routing_table();
+        send_unsolicited_update(sock);
+    }
+
+    return table_changed;
+}
+
+void graceful_shutdown(int sock)
+{
+    if (rip_database.num_entries == 0)
+        return;
+
+    printf("[SHUTDOWN] Signal received, sending final poisoned update...\n");
+
+    time_t now = time(NULL);
+    for (int i = 0; i < rip_database.num_entries; i++)
+    {
+        struct route_entry *route = &rip_database.entries[i];
+        if (route->is_local)
+        {
+            route->metric = 16;
+            route->invalid_since = now;
+            route->last_update = now;
+        }
+    }
+
+    send_unsolicited_update(sock);
+
+    for (int i = rip_database.num_entries - 1; i >= 0; i--)
+    {
+        remove_kernel_route(&rip_database.entries[i]);
+        remove_route_at_index(i);
+    }
+
+    printf("[SHUTDOWN] Kernel routes removed and RIP database cleared.\n");
 }
 
 void send_full_table_unicast(int sock, struct sockaddr_in *requester_addr, const char *request_iface_name)
@@ -177,6 +451,7 @@ void add_route(uint32_t network, uint32_t subnet_mask, uint32_t next_hop, uint32
 
     new_route->is_local = is_local;
     new_route->last_update = time(NULL);
+    new_route->invalid_since = 0;
 
     rip_database.num_entries++;
 }
@@ -230,7 +505,7 @@ void print_routing_table(void)
     printf("=========================================================================================\n\n");
 }
 
-void process_route(uint32_t network, uint32_t netmask, uint32_t pkt_next_hop, uint32_t received_metric, const char *sender_ip)
+int process_route(uint32_t network, uint32_t netmask, uint32_t pkt_next_hop, uint32_t received_metric, const char *sender_ip)
 {
     // calcolo della nuova metrica (costo + 1)
     uint32_t new_metric = received_metric + 1;
@@ -246,6 +521,7 @@ void process_route(uint32_t network, uint32_t netmask, uint32_t pkt_next_hop, ui
 
     // ricerca della rete nel database
     struct route_entry *existing_route = find_route(network, netmask);
+    int route_changed = 0;
 
     // caso 1: rotta nuova
     if (existing_route == NULL)
@@ -262,11 +538,13 @@ void process_route(uint32_t network, uint32_t netmask, uint32_t pkt_next_hop, ui
             // aggiornamento routing table dell'host
             char cmd[256];
             int prefix = mask_to_prefix(netmask);
-            snprintf(cmd, sizeof(cmd), "ip route add %s/%d via %s metric %u", inet_ntoa(net_addr), prefix, sender_ip, new_metric);
+            snprintf(cmd, sizeof(cmd), "ip route replace %s/%d via %s metric %u", inet_ntoa(net_addr), prefix, sender_ip, new_metric);
             printf("[KERNEL] Executing: %s\n", cmd);
             int ret = system(cmd);
             if (ret != 0)
                 printf("[KERNEL] Command failed with code %d\n", ret);
+
+            route_changed = 1;
         }
     }
     // caso 2: la rotta esiste già nel database
@@ -274,7 +552,7 @@ void process_route(uint32_t network, uint32_t netmask, uint32_t pkt_next_hop, ui
     {
         // se locale non va toccata
         if (existing_route->is_local == 1)
-            return;
+            return 0;
 
         // controllo se arriva dallo stesso router da cui l'avevamo imparata
         // si aggiorna sempre (reset timer e metrica) anche se la rotta è peggiorata
@@ -295,6 +573,8 @@ void process_route(uint32_t network, uint32_t netmask, uint32_t pkt_next_hop, ui
                     snprintf(cmd, sizeof(cmd), "ip route del %s/%d", inet_ntoa(net_addr), prefix);
                     printf("[KERNEL] Route unreachable, executing: %s\n", cmd);
                     system(cmd);
+
+                    existing_route->invalid_since = time(NULL);
                 }
                 else
                 {
@@ -304,11 +584,19 @@ void process_route(uint32_t network, uint32_t netmask, uint32_t pkt_next_hop, ui
                              inet_ntoa(net_addr), prefix, sender_ip, new_metric);
                     printf("[KERNEL] Executing: %s\n", cmd);
                     system(cmd);
+
+                    existing_route->invalid_since = 0;
                 }
+
+                route_changed = 1;
             }
 
             existing_route->metric = new_metric;
             existing_route->last_update = time(NULL); // Azzera il timer di scadenza (Garbage Collector)
+            if (new_metric < 16)
+            {
+                existing_route->invalid_since = 0;
+            }
         }
         // la rotta arriva da un router diverso ma offre un percorso migliore
         else if (new_metric < existing_route->metric)
@@ -321,6 +609,8 @@ void process_route(uint32_t network, uint32_t netmask, uint32_t pkt_next_hop, ui
             existing_route->next_hop = actual_next_hop;
             existing_route->metric = new_metric;
             existing_route->last_update = time(NULL);
+            existing_route->invalid_since = 0;
+            route_changed = 1;
 
             // aggiornamento routing table dell'host
             char cmd[256];
@@ -336,6 +626,8 @@ void process_route(uint32_t network, uint32_t netmask, uint32_t pkt_next_hop, ui
         print_routing_table();
         // se la rotta arriva da un router diverso ed ha un costo uguale o peggiore viene ignorata
     }
+
+    return route_changed;
 }
 
 void process_rip_packet(int sock, struct rip_packet *pkt, int bytes_received, struct sockaddr_in *sender_addr)
@@ -419,6 +711,7 @@ void process_rip_packet(int sock, struct rip_packet *pkt, int bytes_received, st
     else if (pkt->command == 2)
     {
         printf("Received an Update from %s with %d routes. Checking routes...\n", sender_ip, num_entries);
+        int any_route_changed = 0;
 
         for (int i = 0; i < num_entries; i++)
         {
@@ -433,9 +726,18 @@ void process_rip_packet(int sock, struct rip_packet *pkt, int bytes_received, st
 
                 if (metric > 0 && metric <= 16)
                 {
-                    process_route(network, netmask, next_hop, metric, sender_ip);
+                    if (process_route(network, netmask, next_hop, metric, sender_ip))
+                    {
+                        any_route_changed = 1;
+                    }
                 }
             }
+        }
+
+        if (any_route_changed)
+        {
+            printf("[TRIGGERED] Sending immediate RIP update after topology change...\n");
+            send_unsolicited_update(sock);
         }
     }
 }

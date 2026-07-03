@@ -8,7 +8,8 @@
 #include "rip-protocol-specs.h"
 
 #define MAX_ROUTING_TABLE_ENTRIES 100
-#define ROUTE_TIMEOUT 180 // 3 minuti - route expiration time in seconds
+#define ROUTE_TIMEOUT 30            // per dimostrazione lo abbasso
+#define GARBAGE_COLLECTION_TIMER 20 // Tempo di garbage collection dopo poison della metrica a 16
 
 // Internal routing table entry for RIP
 struct route_entry
@@ -19,6 +20,7 @@ struct route_entry
     uint32_t metric;                  // Cost (RIP metric)
     char interface_name[IF_NAMESIZE]; // Outgoing interface
     time_t last_update;               // Timestamp of last update (for expiration)
+    time_t invalid_since;             // Timestamp when metric became 16
     int is_local;                     // 1 if directly connected, 0 if learned from RIP
 };
 
@@ -33,6 +35,9 @@ struct routing_table
 extern struct routing_table rip_database;
 
 void send_unsolicited_update(int sock);
+int expire_timed_out_routes(int sock);
+int refresh_local_interface_routes(int sock);
+void graceful_shutdown(int sock);
 
 void init_rip_database(void);
 void send_full_table_unicast(int sock, struct sockaddr_in *requester_addr, const char *request_iface_name);
