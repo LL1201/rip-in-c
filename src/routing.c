@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <arpa/inet.h>
 #include "routing.h"
 #include "network.h"
@@ -13,12 +14,200 @@
 #include <netinet/in.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <linux/rtnetlink.h>
 
 #define CONFIG_FILE "/app/router.conf"
 
 struct routing_table rip_database;
 
-// Helper: Convert subnet mask to CIDR prefix length
+// Socket netlink usato per parlare con il kernel.
+static int routing_netlink_sock = -1;
+
+static int mask_to_prefix(uint32_t mask);
+
+#ifndef NLMSG_TAIL
+#define NLMSG_TAIL(nmsg) ((struct rtattr *)(((void *)(nmsg)) + NLMSG_ALIGN((nmsg)->nlmsg_len)))
+#endif
+
+void init_routing_netlink_socket(int nl_sock)
+{
+    routing_netlink_sock = nl_sock;
+}
+
+// Aggiunge un attributo alla fine del messaggio netlink.
+// Questa funzione è piccola apposta: fa solo il controllo degli spazi.
+static int rtattr_add(struct nlmsghdr *n, int maxlen, int type, const void *data, int alen)
+{
+    int len = RTA_LENGTH(alen);
+    struct rtattr *rta;
+
+    if (NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(len) > (unsigned int)maxlen)
+    {
+        fprintf(stderr, "[NETLINK] rtattr_add failed: maxlen=%d\n", maxlen);
+        return -1;
+    }
+
+    rta = NLMSG_TAIL(n);
+    rta->rta_type = type;
+    rta->rta_len = len;
+
+    if (alen)
+        memcpy(RTA_DATA(rta), data, alen);
+
+    n->nlmsg_len = NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(len);
+    return 0;
+}
+
+// Invia al kernel una singola operazione sulla routing table.
+// cmd può essere RTM_NEWROUTE oppure RTM_DELROUTE.
+static int do_route(int sock, int cmd, int flags, uint32_t dst, uint8_t dst_prefix_len, uint32_t gw, int has_gw, int if_idx, uint32_t metric)
+{
+    struct
+    {
+        struct nlmsghdr n;
+        struct rtmsg r;
+        char buf[4096];
+    } request;
+
+    memset(&request, 0, sizeof(request));
+
+    // Header netlink di base.
+    request.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+    request.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | flags;
+    request.n.nlmsg_type = cmd;
+    request.n.nlmsg_seq = (uint32_t)time(NULL);
+
+    request.r.rtm_family = AF_INET;
+    request.r.rtm_table = RT_TABLE_MAIN;
+    request.r.rtm_scope = RT_SCOPE_LINK;
+    request.r.rtm_dst_len = dst_prefix_len;
+
+    // Per le nuove rotte impostiamo anche protocollo e tipo.
+    if (cmd != RTM_DELROUTE)
+    {
+        request.r.rtm_protocol = RTPROT_STATIC;
+        request.r.rtm_type = RTN_UNICAST;
+    }
+
+    // Se c'è un gateway lo aggiungiamo subito.
+    if (has_gw)
+    {
+        if (rtattr_add(&request.n, sizeof(request), RTA_GATEWAY, &gw, sizeof(gw)) < 0)
+            return -1;
+        request.r.rtm_scope = RT_SCOPE_UNIVERSE;
+    }
+
+    // Destinazione della rotta.
+    if (rtattr_add(&request.n, sizeof(request), RTA_DST, &dst, sizeof(dst)) < 0)
+        return -1;
+
+    // Se non usiamo un gateway, specifichiamo l'interfaccia di uscita.
+    if (!has_gw && if_idx > 0)
+    {
+        if (rtattr_add(&request.n, sizeof(request), RTA_OIF, &if_idx, sizeof(if_idx)) < 0)
+            return -1;
+    }
+
+    // Per le nuove rotte aggiungiamo anche la metrica.
+    if (cmd != RTM_DELROUTE && metric > 0)
+    {
+        if (rtattr_add(&request.n, sizeof(request), RTA_PRIORITY, &metric, sizeof(metric)) < 0)
+            return -1;
+    }
+
+    struct sockaddr_nl kernel_addr;
+    memset(&kernel_addr, 0, sizeof(kernel_addr));
+    kernel_addr.nl_family = AF_NETLINK;
+
+    struct iovec iov = {
+        .iov_base = &request.n,
+        .iov_len = request.n.nlmsg_len,
+    };
+
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = &kernel_addr;
+    msg.msg_namelen = sizeof(kernel_addr);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    if (sendmsg(sock, &msg, 0) < 0)
+    {
+        perror("[NETLINK] sendmsg failed");
+        return -1;
+    }
+
+    // Il kernel risponde con ACK o con un errore.
+    unsigned char reply[4096];
+    struct iovec reply_iov = {
+        .iov_base = reply,
+        .iov_len = sizeof(reply),
+    };
+
+    struct msghdr reply_msg;
+    memset(&reply_msg, 0, sizeof(reply_msg));
+    reply_msg.msg_name = &kernel_addr;
+    reply_msg.msg_namelen = sizeof(kernel_addr);
+    reply_msg.msg_iov = &reply_iov;
+    reply_msg.msg_iovlen = 1;
+
+    ssize_t reply_len = recvmsg(sock, &reply_msg, 0);
+    if (reply_len < 0)
+    {
+        perror("[NETLINK] recvmsg failed");
+        return -1;
+    }
+
+    for (struct nlmsghdr *reply_nlh = (struct nlmsghdr *)reply; NLMSG_OK(reply_nlh, (unsigned int)reply_len); reply_nlh = NLMSG_NEXT(reply_nlh, reply_len))
+    {
+        if (reply_nlh->nlmsg_type == NLMSG_ERROR)
+        {
+            struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(reply_nlh);
+            if (err->error == 0)
+                return 0;
+
+            errno = -err->error;
+            perror("[NETLINK] route operation failed");
+            return -1;
+        }
+
+        if (reply_nlh->nlmsg_type == NLMSG_DONE)
+            return 0;
+    }
+
+    return 0;
+}
+
+// Wrapper semplice: decide solo cosa vogliamo fare e prepara i parametri.
+static int send_route_request(int nlmsg_type, uint32_t network, uint32_t subnet_mask, uint32_t gateway, uint32_t metric, const char *interface_name, int use_gateway)
+{
+    if (routing_netlink_sock < 0)
+    {
+        fprintf(stderr, "[NETLINK] Socket not initialized\n");
+        return -1;
+    }
+
+    int flags = 0;
+    int if_idx = 0;
+
+    if (nlmsg_type == RTM_NEWROUTE)
+        flags = NLM_F_CREATE | NLM_F_REPLACE;
+
+    if (!use_gateway && interface_name != NULL && interface_name[0] != '\0')
+    {
+        if_idx = (int)if_nametoindex(interface_name);
+        if (if_idx == 0)
+        {
+            fprintf(stderr, "[NETLINK] Unable to resolve interface index for %s\n", interface_name);
+            return -1;
+        }
+    }
+
+    return do_route(routing_netlink_sock, nlmsg_type, flags, network, (uint8_t)mask_to_prefix(subnet_mask), gateway, use_gateway, if_idx, metric);
+}
+
+// new
+//  Helper: Convert subnet mask to CIDR prefix length
 static int mask_to_prefix(uint32_t mask)
 {
     int prefix = 0;
@@ -57,19 +246,14 @@ static void remove_route_at_index(int index)
     rip_database.num_entries--;
 }
 
-static void remove_kernel_route(struct route_entry *route)
+static int add_or_replace_kernel_route(struct route_entry *route)
 {
-    struct in_addr net_addr;
-    char net_str[INET_ADDRSTRLEN];
+    return send_route_request(RTM_NEWROUTE, route->network, route->subnet_mask, route->next_hop, route->metric, route->is_local ? route->interface_name : NULL, !route->is_local);
+}
 
-    net_addr.s_addr = route->network;
-    inet_ntop(AF_INET, &net_addr, net_str, INET_ADDRSTRLEN);
-
-    int prefix = mask_to_prefix(route->subnet_mask);
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "ip route del %s/%d", net_str, prefix);
-    printf("[KERNEL] Removing route during shutdown: %s\n", cmd);
-    system(cmd);
+static int delete_kernel_route(struct route_entry *route)
+{
+    return send_route_request(RTM_DELROUTE, route->network, route->subnet_mask, 0, 0, NULL, 0);
 }
 
 static int interface_is_up(const char *interface_name, struct in_addr *interface_ip)
@@ -118,7 +302,7 @@ static void send_routing_table(int sock, struct sockaddr_in *dest, const char *s
 
     struct rip_packet pkt;
     memset(&pkt, 0, sizeof(struct rip_packet));
-    pkt.command = 2; // Update / Response
+    pkt.command = 2;
     pkt.version = 2;
     int num_entries_in_pkt = 0;
 
@@ -127,21 +311,21 @@ static void send_routing_table(int sock, struct sockaddr_in *dest, const char *s
         struct route_entry *route = &rip_database.entries[i];
         uint32_t metric = route->metric;
 
-        // Split Horizon con Poisoned Reverse
+        // split Horizon con Poisoned Reverse
         if (!route->is_local && strcmp(route->interface_name, split_horizon_iface) == 0)
         {
             metric = 16;
         }
 
-        pkt.entries[num_entries_in_pkt].addr_family = htons(2);
+        pkt.entries[num_entries_in_pkt].addr_family = htons(2); // campo da 16 bit
         pkt.entries[num_entries_in_pkt].ip_address = route->network;
         pkt.entries[num_entries_in_pkt].subnet_mask = route->subnet_mask;
-        pkt.entries[num_entries_in_pkt].next_hop = inet_addr("0.0.0.0");
-        pkt.entries[num_entries_in_pkt].metric = htonl(metric);
+        pkt.entries[num_entries_in_pkt].next_hop = inet_addr("0.0.0.0"); // converte in binario l'indirizzo
+        pkt.entries[num_entries_in_pkt].metric = htonl(metric);          // campo da 32 bit
 
         num_entries_in_pkt++;
 
-        // Paginazione: se raggiungiamo 25 entry, inviamo il pacchetto e resettiamo
+        // se si arriva a 25 entry, il pacchetto viene inviato e si inizia a costruirne un altro
         if (num_entries_in_pkt == 25)
         {
             send_rip_packet(sock, &pkt, 25, dest, out_iface_ip);
@@ -153,7 +337,7 @@ static void send_routing_table(int sock, struct sockaddr_in *dest, const char *s
         }
     }
 
-    // Inviamo le eventuali entry rimanenti
+    // invio delle entry < 25
     if (num_entries_in_pkt > 0)
     {
         send_rip_packet(sock, &pkt, num_entries_in_pkt, dest, out_iface_ip);
@@ -218,15 +402,13 @@ int refresh_local_interface_routes(int sock)
 
                 struct in_addr net_addr;
                 char net_str[INET_ADDRSTRLEN];
-                int prefix = mask_to_prefix(route->subnet_mask);
-                char cmd[256];
 
                 net_addr.s_addr = route->network;
                 inet_ntop(AF_INET, &net_addr, net_str, INET_ADDRSTRLEN);
-                snprintf(cmd, sizeof(cmd), "ip route replace %s/%d via %s metric 1", net_str, prefix, inet_ntoa(current_ip));
-                printf("[LINK] Interface %s is up again, restoring route %s/%d\n", networks[iface_idx].interface_name, net_str, prefix);
-                printf("[KERNEL] Executing: %s\n", cmd);
-                system(cmd);
+                printf("[LINK] Interface %s is up again, restoring route %s/%d\n", networks[iface_idx].interface_name, net_str, mask_to_prefix(route->subnet_mask));
+
+                if (add_or_replace_kernel_route(route) < 0)
+                    printf("[NETLINK] Failed to restore local route %s\n", net_str);
             }
         }
         else
@@ -244,16 +426,17 @@ int refresh_local_interface_routes(int sock)
                 if (!ip_in_network(dependent_route->next_hop, networks[iface_idx].network, networks[iface_idx].netmask))
                     continue;
 
-                remove_kernel_route(dependent_route);
-                dependent_route->metric = 16;
-                dependent_route->invalid_since = now;
-                dependent_route->last_update = now;
-                table_changed = 1;
-
                 struct in_addr dependent_net_addr;
                 char dependent_net_str[INET_ADDRSTRLEN];
                 dependent_net_addr.s_addr = dependent_route->network;
                 inet_ntop(AF_INET, &dependent_net_addr, dependent_net_str, INET_ADDRSTRLEN);
+
+                if (delete_kernel_route(dependent_route) < 0)
+                    printf("[NETLINK] Failed to delete dependent route %s\n", dependent_net_str);
+                dependent_route->metric = 16;
+                dependent_route->invalid_since = now;
+                dependent_route->last_update = now;
+                table_changed = 1;
                 printf("[LINK] Interface %s is down, poisoning dependent route %s\n",
                        networks[iface_idx].interface_name, dependent_net_str);
             }
@@ -262,8 +445,6 @@ int refresh_local_interface_routes(int sock)
             {
                 struct in_addr net_addr;
                 char net_str[INET_ADDRSTRLEN];
-                int prefix = mask_to_prefix(route->subnet_mask);
-                char cmd[256];
 
                 net_addr.s_addr = route->network;
                 inet_ntop(AF_INET, &net_addr, net_str, INET_ADDRSTRLEN);
@@ -273,10 +454,9 @@ int refresh_local_interface_routes(int sock)
                 route->last_update = now;
                 table_changed = 1;
 
-                snprintf(cmd, sizeof(cmd), "ip route del %s/%d", net_str, prefix);
-                printf("[LINK] Interface %s is down, poisoning local route %s/%d\n", networks[iface_idx].interface_name, net_str, prefix);
-                printf("[KERNEL] Executing: %s\n", cmd);
-                system(cmd);
+                printf("[LINK] Interface %s is down, poisoning local route %s/%d\n", networks[iface_idx].interface_name, net_str, mask_to_prefix(route->subnet_mask));
+                if (delete_kernel_route(route) < 0)
+                    printf("[NETLINK] Failed to delete local route %s\n", net_str);
             }
         }
     }
@@ -310,12 +490,9 @@ int expire_timed_out_routes(int sock)
             net_addr.s_addr = route->network;
             inet_ntop(AF_INET, &net_addr, net_str, INET_ADDRSTRLEN);
 
-            int prefix = mask_to_prefix(route->subnet_mask);
-            char cmd[256];
-            snprintf(cmd, sizeof(cmd), "ip route del %s/%d", net_str, prefix);
-            printf("[GC] Removing expired route %s/%d from database\n", net_str, prefix);
-            printf("[KERNEL] Garbage collection executing: %s\n", cmd);
-            system(cmd);
+            printf("[GC] Removing expired route %s/%d from database\n", net_str, mask_to_prefix(route->subnet_mask));
+            if (delete_kernel_route(route) < 0)
+                printf("[NETLINK] Failed to remove expired route %s\n", net_str);
 
             remove_route_at_index(i);
             table_changed = 1;
@@ -341,12 +518,9 @@ int expire_timed_out_routes(int sock)
             route->invalid_since = now;
             table_changed = 1;
 
-            int prefix = mask_to_prefix(route->subnet_mask);
-            char cmd[256];
-            snprintf(cmd, sizeof(cmd), "ip route del %s/%d", net_str, prefix);
-            printf("[TIMER] Route expired for %s/%d, poisoning metric to 16\n", net_str, prefix);
-            printf("[KERNEL] Route expired, executing: %s\n", cmd);
-            system(cmd);
+            printf("[TIMER] Route expired for %s/%d, poisoning metric to 16\n", net_str, mask_to_prefix(route->subnet_mask));
+            if (delete_kernel_route(route) < 0)
+                printf("[NETLINK] Failed to poison expired route %s\n", net_str);
         }
     }
 
@@ -382,7 +556,8 @@ void graceful_shutdown(int sock)
 
     for (int i = rip_database.num_entries - 1; i >= 0; i--)
     {
-        remove_kernel_route(&rip_database.entries[i]);
+        if (delete_kernel_route(&rip_database.entries[i]) < 0)
+            printf("[NETLINK] Failed to delete route during shutdown\n");
         remove_route_at_index(i);
     }
 
@@ -408,7 +583,7 @@ void init_rip_database(void)
         exit(1);
     }
 
-    // 2. Itera sulle reti fisiche che hai configurato
+    // 2. Itera sulle reti fisiche configurate tramite file
     for (int i = 0; i < num_networks; i++)
     {
         if (networks[i].interface_name[0] == '\0')
@@ -536,13 +711,9 @@ int process_route(uint32_t network, uint32_t netmask, uint32_t pkt_next_hop, uin
             printf("[RIP] Learned NEW route: %s via %s (Metric: %u)\n", inet_ntoa(net_addr), sender_ip, new_metric);
 
             // aggiornamento routing table dell'host
-            char cmd[256];
-            int prefix = mask_to_prefix(netmask);
-            snprintf(cmd, sizeof(cmd), "ip route replace %s/%d via %s metric %u", inet_ntoa(net_addr), prefix, sender_ip, new_metric);
-            printf("[KERNEL] Executing: %s\n", cmd);
-            int ret = system(cmd);
-            if (ret != 0)
-                printf("[KERNEL] Command failed with code %d\n", ret);
+            struct route_entry *new_route = find_route(network, netmask);
+            if (new_route != NULL && add_or_replace_kernel_route(new_route) < 0)
+                printf("[NETLINK] Failed to install new route %s\n", inet_ntoa(net_addr));
 
             route_changed = 1;
         }
@@ -568,23 +739,14 @@ int process_route(uint32_t network, uint32_t netmask, uint32_t pkt_next_hop, uin
                 // aggiornamento routing table dell'host
                 if (new_metric == 16)
                 {
-                    char cmd[256];
-                    int prefix = mask_to_prefix(netmask);
-                    snprintf(cmd, sizeof(cmd), "ip route del %s/%d", inet_ntoa(net_addr), prefix);
-                    printf("[KERNEL] Route unreachable, executing: %s\n", cmd);
-                    system(cmd);
-
+                    if (delete_kernel_route(existing_route) < 0)
+                        printf("[NETLINK] Failed to delete unreachable route %s\n", inet_ntoa(net_addr));
                     existing_route->invalid_since = time(NULL);
                 }
                 else
                 {
-                    char cmd[256];
-                    int prefix = mask_to_prefix(netmask);
-                    snprintf(cmd, sizeof(cmd), "ip route replace %s/%d via %s metric %u",
-                             inet_ntoa(net_addr), prefix, sender_ip, new_metric);
-                    printf("[KERNEL] Executing: %s\n", cmd);
-                    system(cmd);
-
+                    if (add_or_replace_kernel_route(existing_route) < 0)
+                        printf("[NETLINK] Failed to update route %s\n", inet_ntoa(net_addr));
                     existing_route->invalid_since = 0;
                 }
 
@@ -613,14 +775,8 @@ int process_route(uint32_t network, uint32_t netmask, uint32_t pkt_next_hop, uin
             route_changed = 1;
 
             // aggiornamento routing table dell'host
-            char cmd[256];
-            int prefix = mask_to_prefix(netmask);
-            snprintf(cmd, sizeof(cmd), "ip route replace %s/%d via %s metric %u",
-                     inet_ntoa(net_addr), prefix, sender_ip, new_metric);
-            printf("[KERNEL] Executing: %s\n", cmd);
-            int ret = system(cmd);
-            if (ret != 0)
-                printf("[KERNEL] Command failed with code %d\n", ret);
+            if (add_or_replace_kernel_route(existing_route) < 0)
+                printf("[NETLINK] Failed to improve route %s\n", inet_ntoa(net_addr));
         }
 
         print_routing_table();

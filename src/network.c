@@ -5,12 +5,17 @@
 #include "rip-protocol-specs.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <asm/types.h>
+#include <sys/socket.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 
 #define CONFIG_FILE "/app/router.conf"
 
@@ -18,7 +23,7 @@
 struct network_config networks[MAX_NETWORKS];
 int num_networks = 0;
 
-// Parse della notazione CIDR nel file di config
+// Parse della notazione CIDR nel file di config e copia dei valori nei campi puntati dai puntatori
 static void parse_cidr(const char *cidr, uint32_t *network, uint32_t *netmask)
 {
     char *slash = strchr(cidr, '/');
@@ -74,9 +79,66 @@ static void load_config()
     fclose(f);
 }
 
+int create_netlink_socket()
+{
+    struct sockaddr_nl saddr;
+
+    int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+
+    if (sock < 0)
+    {
+        perror("Failed to open netlink socket");
+        return -1;
+    }
+
+    memset(&saddr, 0, sizeof(saddr));
+    saddr.nl_family = AF_NETLINK;
+    saddr.nl_pid = (unsigned int)getpid();
+    saddr.nl_groups = RTMGRP_LINK;
+
+    if (bind(sock, (struct sockaddr *)&saddr, sizeof(saddr)) < 0)
+    {
+        perror("Failed to bind netlink socket");
+        close(sock);
+        return -1;
+    }
+
+    return sock;
+}
+
+int handle_netlink_link_events(int nl_sock)
+{
+    char buffer[4096];
+    int saw_link_event = 0;
+
+    while (1)
+    {
+        ssize_t len = recv(nl_sock, buffer, sizeof(buffer), MSG_DONTWAIT);
+        if (len < 0)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+
+            perror("[NETLINK] recv failed");
+            break;
+        }
+
+        if (len == 0)
+            break;
+
+        for (struct nlmsghdr *nlh = (struct nlmsghdr *)buffer; NLMSG_OK(nlh, (unsigned int)len); nlh = NLMSG_NEXT(nlh, len))
+        {
+            if (nlh->nlmsg_type == RTM_NEWLINK || nlh->nlmsg_type == RTM_DELLINK || nlh->nlmsg_type == RTM_SETLINK)
+                saw_link_event = 1;
+        }
+    }
+
+    return saw_link_event;
+}
+
 int create_rip_socket()
 {
-    // Load configuration first
+    // carica la config dal file
     load_config();
 
     if (num_networks == 0)
@@ -92,11 +154,11 @@ int create_rip_socket()
         exit(1);
     }
 
-    // Reuse address/port
+    // reuse della porta del socket utile se il programma va in crash e riparte subito
     int reuse = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
-    // Bind to RIP port
+    // RIP binding
     struct sockaddr_in local_addr;
     memset(&local_addr, 0, sizeof(local_addr));
     local_addr.sin_family = AF_INET;
@@ -119,23 +181,24 @@ int create_rip_socket()
 
     for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
     {
-        // Skip interfaces that are not up or are loopback
+        // skippa le interfacce di loopback oppure spente
         if (ifa->ifa_addr == NULL || !(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK))
             continue;
 
-        // Only process IPv4 interfaces
+        // invia solo su interfacce ipv4
         if (ifa->ifa_addr->sa_family != AF_INET)
             continue;
 
         struct sockaddr_in *addr = (struct sockaddr_in *)ifa->ifa_addr;
         uint32_t interface_ip = addr->sin_addr.s_addr;
 
-        // Check if this interface IP belongs to any configured network
+        // per ogni scheda di rete controlla se il suo ip rientra tra quelle da abilitare
+        // in caso fa il join al gruppo multicast
         for (int i = 0; i < num_networks; i++)
         {
             if (ip_in_network(interface_ip, networks[i].network, networks[i].netmask))
             {
-                // Join multicast group on this interface
+                // join al gruppo multicast
                 struct ip_mreq mreq;
                 mreq.imr_multiaddr.s_addr = inet_addr(RIP_MULTICAST_ADDR);
                 mreq.imr_interface.s_addr = interface_ip;
@@ -157,7 +220,7 @@ int create_rip_socket()
 
     freeifaddrs(ifaddr);
 
-    // Disable multicast loopback to avoid receiving our own packets
+    // disabilita IP_MULTICAST_LOOP in modo che i pacchetti in uscita non vengano ricevuti da sé stesso
     int loop = 0;
     setsockopt(sock, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
 

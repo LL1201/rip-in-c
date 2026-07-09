@@ -23,6 +23,8 @@ extern struct network_config networks[MAX_NETWORKS];
 extern int num_networks;
 
 int create_rip_socket();
+int create_netlink_socket();
+int handle_netlink_link_events(int nl_sock);
 int ip_in_network(uint32_t ip, uint32_t network, uint32_t mask);
 void send_rip_packet(int sock, struct rip_packet *pkt, int num_entries, struct sockaddr_in *dest, struct in_addr *out_iface_ip);
 

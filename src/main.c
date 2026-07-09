@@ -11,7 +11,7 @@
 #include "rip-protocol-specs.h"
 #include "routing.h"
 
-#define BASE_UPDATE_TIMER 5
+#define BASE_UPDATE_TIMER 10
 
 static volatile sig_atomic_t shutdown_requested = 0;
 
@@ -32,7 +32,7 @@ int get_jittered_timer()
 
 int main()
 {
-    // buffering disabilitato per leggere i log tramite docker logs
+    // buffering disabilitato per leggere i log tramite il comando docker logs
     setvbuf(stdout, NULL, _IONBF, 0);
 
     struct sigaction action;
@@ -47,6 +47,15 @@ int main()
     // Create UDP Multicast socket
     int sock = create_rip_socket();
     printf("Socket created. Listening on %s:%d\n", RIP_MULTICAST_ADDR, RIP_PORT);
+
+    int nl_sock = create_netlink_socket();
+    if (nl_sock < 0)
+    {
+        fprintf(stderr, "Failed to create netlink socket\n");
+        close(sock);
+        return 1;
+    }
+    init_routing_netlink_socket(nl_sock);
 
     srand(time(NULL) ^ getpid());
 
@@ -79,6 +88,7 @@ int main()
 
         FD_ZERO(&readfds);
         FD_SET(sock, &readfds);
+        FD_SET(nl_sock, &readfds);
 
         gettimeofday(&now, NULL);
 
@@ -109,7 +119,10 @@ int main()
             tv.tv_usec = 0;
         }
 
-        int activity = select(sock + 1, &readfds, NULL, NULL, &tv);
+        // Il primo parametro della select deve essere il file descriptor più alto + 1
+        int max_fd = (sock > nl_sock) ? sock : nl_sock;
+
+        int activity = select(max_fd + 1, &readfds, NULL, NULL, &tv);
 
         if (activity < 0)
         {
@@ -137,11 +150,21 @@ int main()
                 process_rip_packet(sock, &incoming_packet, bytes_received, &sender_addr);
             }
         }
+        else if (activity > 0 && FD_ISSET(nl_sock, &readfds))
+        {
+            // Il kernel ci ha avvisato che un link è cambiato.
+            // Non facciamo parsing complicato: svuotiamo la coda e rieseguiamo il refresh.
+            if (handle_netlink_link_events(nl_sock))
+            {
+                refresh_local_interface_routes(sock);
+            }
+        }
         // if (activity == 0) il loop si riavvia
     }
 
     graceful_shutdown(sock);
 
+    close(nl_sock);
     close(sock);
     return 0;
 }
