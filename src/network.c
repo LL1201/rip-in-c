@@ -52,6 +52,31 @@ int ip_in_network(uint32_t ip, uint32_t network, uint32_t netmask)
     return (ip & netmask) == (network & netmask);
 }
 
+// Controlla lo stato reale della scheda leggendo sysfs.
+// Con le veth il peer può andare giù anche se la scheda resta "UP" dal punto di vista amministrativo.
+static int interface_has_carrier(const char *interface_name)
+{
+    char path[256];
+    char state[32];
+    FILE *f;
+
+    snprintf(path, sizeof(path), "/sys/class/net/%s/operstate", interface_name);
+    f = fopen(path, "r");
+    if (f == NULL)
+        return 0;
+
+    if (fgets(state, sizeof(state), f) == NULL)
+    {
+        fclose(f);
+        return 0;
+    }
+
+    fclose(f);
+
+    // "up" significa carrier presente; gli altri stati li trattiamo come down.
+    return (strncmp(state, "up", 2) == 0);
+}
+
 // Load networks from config file
 static void load_config()
 {
@@ -143,15 +168,15 @@ int create_rip_socket()
 
     if (num_networks == 0)
     {
-        fprintf(stderr, "Error: No networks configured in RIP Database");
-        exit(1);
+        fprintf(stderr, "Error: No networks configured in RIP Database\n");
+        return -1;
     }
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0)
     {
         perror("Socket creation failed");
-        exit(1);
+        return -1;
     }
 
     // reuse della porta del socket utile se il programma va in crash e riparte subito
@@ -168,7 +193,7 @@ int create_rip_socket()
     if (bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0)
     {
         perror("bind() failed");
-        exit(1);
+        return -1;
     }
 
     // Join RIPv2 Multicast group on interfaces that match configured subnets
@@ -176,17 +201,21 @@ int create_rip_socket()
     if (getifaddrs(&ifaddr) < 0)
     {
         perror("getifaddrs() failed");
-        exit(1);
+        return -1;
     }
 
     for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
     {
-        // skippa le interfacce di loopback oppure spente
-        if (ifa->ifa_addr == NULL || !(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK))
+        // skippa le interfacce senza indirizzo, loopback oppure senza carrier.
+        if (ifa->ifa_addr == NULL || (ifa->ifa_flags & IFF_LOOPBACK))
             continue;
 
         // invia solo su interfacce ipv4
         if (ifa->ifa_addr->sa_family != AF_INET)
+            continue;
+
+        // Se il carrier non c'è, la veth è da considerare giù anche se il flag amministrativo è UP.
+        if (!interface_has_carrier(ifa->ifa_name))
             continue;
 
         struct sockaddr_in *addr = (struct sockaddr_in *)ifa->ifa_addr;

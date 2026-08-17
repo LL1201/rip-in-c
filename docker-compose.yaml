@@ -47,26 +47,25 @@ services:
     networks:
       rip-in-c-ax-net:
         ipv4_address: 10.12.10.254
-      rip-in-c-ab-net:
-        ipv4_address: 10.12.1.3
-      rip-in-c-ac-net:
-        ipv4_address: 10.12.4.2
-      rip-in-c-ac2-net:
-        ipv4_address: 10.12.5.2
+    #  rip-in-c-ab-net:
+    #    ipv4_address: 10.12.1.3
+    #  rip-in-c-ac-net:
+    #    ipv4_address: 10.12.4.2
     volumes:
       - ./configs/router-A.conf:/app/router.conf
     sysctls:
       - net.ipv4.ip_forward=1 # ABILITA IL ROUTING DI LINUX
     cap_add:
       - NET_ADMIN
+    command: tail -f /dev/null
 
   # --- ROUTER B ---
   router_b:
     build: .
     container_name: router-B
     networks:
-      rip-in-c-ab-net:
-        ipv4_address: 10.12.1.2
+    #  rip-in-c-ab-net:
+    #    ipv4_address: 10.12.1.2
       rip-in-c-bc-net:
         ipv4_address: 10.12.2.2
     volumes:
@@ -75,6 +74,7 @@ services:
       - net.ipv4.ip_forward=1
     cap_add:
       - NET_ADMIN
+    command: tail -f /dev/null
 
   # --- ROUTER C ---
   router_c:
@@ -85,16 +85,15 @@ services:
         ipv4_address: 10.12.2.3
       rip-in-c-cy-net:
         ipv4_address: 10.12.20.254
-      rip-in-c-ac-net:
-        ipv4_address: 10.12.4.3
-      rip-in-c-ac2-net:
-        ipv4_address: 10.12.5.3
+      #rip-in-c-ac-net:
+        #ipv4_address: 10.12.4.3      
     volumes:
       - ./configs/router-C.conf:/app/router.conf
     sysctls:
       - net.ipv4.ip_forward=1
     cap_add:
       - NET_ADMIN
+    command: tail -f /dev/null
 
   # --- CLIENT rete CY ---
   client_cy:

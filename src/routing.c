@@ -9,7 +9,6 @@
 #include "network.h"
 #include <string.h>
 #include "rip-protocol-specs.h"
-#include "network.h"
 #include <unistd.h>
 #include <netinet/in.h>
 #include <ifaddrs.h>
@@ -36,14 +35,14 @@ void init_routing_netlink_socket(int nl_sock)
 
 // Aggiunge un attributo alla fine del messaggio netlink.
 // Questa funzione è piccola apposta: fa solo il controllo degli spazi.
-static int rtattr_add(struct nlmsghdr *n, int maxlen, int type, const void *data, int alen)
+static int netlink_add_attribute(struct nlmsghdr *n, int maxlen, int type, const void *data, int alen)
 {
     int len = RTA_LENGTH(alen);
     struct rtattr *rta;
 
     if (NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(len) > (unsigned int)maxlen)
     {
-        fprintf(stderr, "[NETLINK] rtattr_add failed: maxlen=%d\n", maxlen);
+        fprintf(stderr, "[NETLINK] add_attribute failed: maxlen=%d\n", maxlen);
         return -1;
     }
 
@@ -60,7 +59,7 @@ static int rtattr_add(struct nlmsghdr *n, int maxlen, int type, const void *data
 
 // Invia al kernel una singola operazione sulla routing table.
 // cmd può essere RTM_NEWROUTE oppure RTM_DELROUTE.
-static int do_route(int sock, int cmd, int flags, uint32_t dst, uint8_t dst_prefix_len, uint32_t gw, int has_gw, int if_idx, uint32_t metric)
+static int netlink_send_route_request(int sock, int cmd, int flags, uint32_t dst, uint8_t dst_prefix_len, uint32_t gw, int has_gw, int if_idx, uint32_t metric)
 {
     struct
     {
@@ -92,26 +91,26 @@ static int do_route(int sock, int cmd, int flags, uint32_t dst, uint8_t dst_pref
     // Se c'è un gateway lo aggiungiamo subito.
     if (has_gw)
     {
-        if (rtattr_add(&request.n, sizeof(request), RTA_GATEWAY, &gw, sizeof(gw)) < 0)
+        if (netlink_add_attribute(&request.n, sizeof(request), RTA_GATEWAY, &gw, sizeof(gw)) < 0)
             return -1;
         request.r.rtm_scope = RT_SCOPE_UNIVERSE;
     }
 
     // Destinazione della rotta.
-    if (rtattr_add(&request.n, sizeof(request), RTA_DST, &dst, sizeof(dst)) < 0)
+    if (netlink_add_attribute(&request.n, sizeof(request), RTA_DST, &dst, sizeof(dst)) < 0)
         return -1;
 
     // Se non usiamo un gateway, specifichiamo l'interfaccia di uscita.
     if (!has_gw && if_idx > 0)
     {
-        if (rtattr_add(&request.n, sizeof(request), RTA_OIF, &if_idx, sizeof(if_idx)) < 0)
+        if (netlink_add_attribute(&request.n, sizeof(request), RTA_OIF, &if_idx, sizeof(if_idx)) < 0)
             return -1;
     }
 
     // Per le nuove rotte aggiungiamo anche la metrica.
     if (cmd != RTM_DELROUTE && metric > 0)
     {
-        if (rtattr_add(&request.n, sizeof(request), RTA_PRIORITY, &metric, sizeof(metric)) < 0)
+        if (netlink_add_attribute(&request.n, sizeof(request), RTA_PRIORITY, &metric, sizeof(metric)) < 0)
             return -1;
     }
 
@@ -179,7 +178,7 @@ static int do_route(int sock, int cmd, int flags, uint32_t dst, uint8_t dst_pref
 }
 
 // Wrapper semplice: decide solo cosa vogliamo fare e prepara i parametri.
-static int send_route_request(int nlmsg_type, uint32_t network, uint32_t subnet_mask, uint32_t gateway, uint32_t metric, const char *interface_name, int use_gateway)
+static int netlink_update_route(int nlmsg_type, uint32_t network, uint32_t subnet_mask, uint32_t gateway, uint32_t metric, const char *interface_name, int use_gateway)
 {
     if (routing_netlink_sock < 0)
     {
@@ -203,7 +202,7 @@ static int send_route_request(int nlmsg_type, uint32_t network, uint32_t subnet_
         }
     }
 
-    return do_route(routing_netlink_sock, nlmsg_type, flags, network, (uint8_t)mask_to_prefix(subnet_mask), gateway, use_gateway, if_idx, metric);
+    return netlink_send_route_request(routing_netlink_sock, nlmsg_type, flags, network, (uint8_t)mask_to_prefix(subnet_mask), gateway, use_gateway, if_idx, metric);
 }
 
 // new
@@ -248,17 +247,44 @@ static void remove_route_at_index(int index)
 
 static int add_or_replace_kernel_route(struct route_entry *route)
 {
-    return send_route_request(RTM_NEWROUTE, route->network, route->subnet_mask, route->next_hop, route->metric, route->is_local ? route->interface_name : NULL, !route->is_local);
+    return netlink_update_route(RTM_NEWROUTE, route->network, route->subnet_mask, route->next_hop, route->metric, route->is_local ? route->interface_name : NULL, !route->is_local);
 }
 
 static int delete_kernel_route(struct route_entry *route)
 {
-    return send_route_request(RTM_DELROUTE, route->network, route->subnet_mask, 0, 0, NULL, 0);
+    return netlink_update_route(RTM_DELROUTE, route->network, route->subnet_mask, 0, 0, NULL, 0);
+}
+
+// Con le veth il peer può andare giù e lasciare la scheda ancora "UP" dal punto di vista amministrativo.
+// Per questo leggiamo operstate da sysfs e consideriamo attiva solo una scheda che riporta "up".
+static int interface_has_carrier(const char *interface_name)
+{
+    char path[256];
+    char state[32];
+    FILE *f;
+
+    snprintf(path, sizeof(path), "/sys/class/net/%s/operstate", interface_name);
+    f = fopen(path, "r");
+    if (f == NULL)
+        return 0;
+
+    if (fgets(state, sizeof(state), f) == NULL)
+    {
+        fclose(f);
+        return 0;
+    }
+
+    fclose(f);
+    return (strncmp(state, "up", 2) == 0);
 }
 
 static int interface_is_up(const char *interface_name, struct in_addr *interface_ip)
 {
     struct ifaddrs *ifaddr, *ifa;
+
+    // Se il carrier non c'è, non serve nemmeno scorrere gli indirizzi.
+    if (!interface_has_carrier(interface_name))
+        return 0;
 
     if (getifaddrs(&ifaddr) < 0)
     {
@@ -267,6 +293,7 @@ static int interface_is_up(const char *interface_name, struct in_addr *interface
     }
 
     int is_up = 0;
+
     for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
     {
         if (ifa->ifa_addr == NULL)
@@ -275,7 +302,7 @@ static int interface_is_up(const char *interface_name, struct in_addr *interface
         if (strcmp(ifa->ifa_name, interface_name) != 0)
             continue;
 
-        if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK))
+        if (ifa->ifa_flags & IFF_LOOPBACK)
             continue;
 
         if (ifa->ifa_addr->sa_family == AF_INET)
@@ -475,6 +502,7 @@ int expire_timed_out_routes(int sock)
     time_t now = time(NULL);
     int table_changed = 0;
 
+    // rimozione route invalide da tot tempo
     for (int i = rip_database.num_entries - 1; i >= 0; i--)
     {
         struct route_entry *route = &rip_database.entries[i];
@@ -499,6 +527,7 @@ int expire_timed_out_routes(int sock)
         }
     }
 
+    // imposta a 16 la metrica di route di cui non si è ricevuto nessun update
     for (int i = 0; i < rip_database.num_entries; i++)
     {
         struct route_entry *route = &rip_database.entries[i];

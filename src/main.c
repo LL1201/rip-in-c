@@ -46,6 +46,11 @@ int main()
 
     // Create UDP Multicast socket
     int sock = create_rip_socket();
+    if (sock < 0)
+    {
+        fprintf(stderr, "Failed to create RIP socket\n");
+        return 1;
+    }
     printf("Socket created. Listening on %s:%d\n", RIP_MULTICAST_ADDR, RIP_PORT);
 
     int nl_sock = create_netlink_socket();
@@ -77,7 +82,6 @@ int main()
     next_update = now;
     next_update.tv_sec += get_jittered_timer();
 
-    // TODO vedere il multithreading
     while (1)
     {
         if (shutdown_requested)
