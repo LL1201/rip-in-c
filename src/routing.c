@@ -100,8 +100,9 @@ static int netlink_send_route_request(int sock, int cmd, int flags, uint32_t dst
     if (netlink_add_attribute(&request.n, sizeof(request), RTA_DST, &dst, sizeof(dst)) < 0)
         return -1;
 
-    // Se non usiamo un gateway, specifichiamo l'interfaccia di uscita.
-    if (!has_gw && if_idx > 0)
+    // Quando disponibile specifichiamo sempre l'interfaccia di uscita.
+    // Anche con gateway aiuta il kernel a evitare link inattesi.
+    if (if_idx > 0)
     {
         if (netlink_add_attribute(&request.n, sizeof(request), RTA_OIF, &if_idx, sizeof(if_idx)) < 0)
             return -1;
@@ -165,6 +166,11 @@ static int netlink_send_route_request(int sock, int cmd, int flags, uint32_t dst
             if (err->error == 0)
                 return 0;
 
+            // La cancellazione di una rotta può essere richiesta più volte in modo
+            // idempotente (es. durante shutdown): se non esiste già, non è un errore.
+            if (cmd == RTM_DELROUTE && -err->error == ESRCH)
+                return 0;
+
             errno = -err->error;
             perror("[NETLINK] route operation failed");
             return -1;
@@ -192,7 +198,7 @@ static int netlink_update_route(int nlmsg_type, uint32_t network, uint32_t subne
     if (nlmsg_type == RTM_NEWROUTE)
         flags = NLM_F_CREATE | NLM_F_REPLACE;
 
-    if (!use_gateway && interface_name != NULL && interface_name[0] != '\0')
+    if (interface_name != NULL && interface_name[0] != '\0')
     {
         if_idx = (int)if_nametoindex(interface_name);
         if (if_idx == 0)
@@ -247,12 +253,22 @@ static void remove_route_at_index(int index)
 
 static int add_or_replace_kernel_route(struct route_entry *route)
 {
-    return netlink_update_route(RTM_NEWROUTE, route->network, route->subnet_mask, route->next_hop, route->metric, route->is_local ? route->interface_name : NULL, !route->is_local);
+    return netlink_update_route(RTM_NEWROUTE, route->network, route->subnet_mask, route->next_hop, route->metric, route->interface_name, !route->is_local);
 }
 
 static int delete_kernel_route(struct route_entry *route)
 {
-    return netlink_update_route(RTM_DELROUTE, route->network, route->subnet_mask, 0, 0, NULL, 0);
+    // Per cancellare in modo affidabile, usiamo gli stessi attributi della rotta installata:
+    // - rotta locale: match su interfaccia di uscita (RTA_OIF)
+    // - rotta RIP: match su gateway (RTA_GATEWAY)
+    return netlink_update_route(
+        RTM_DELROUTE,
+        route->network,
+        route->subnet_mask,
+        route->next_hop,
+        route->metric,
+        route->interface_name,
+        !route->is_local);
 }
 
 // Con le veth il peer può andare giù e lasciare la scheda ancora "UP" dal punto di vista amministrativo.
@@ -399,6 +415,47 @@ void send_unsolicited_update(int sock)
     }
 }
 
+/*
+[Inizio refresh_local_interface_routes]
+  │
+  ├─► Scansione di tutte le interfacce configurate (networks[])
+  │     │
+  │     ├─► Verifica stato interfaccia via interface_is_up()
+  │     │
+  │     ├─► [ CASO 1: Interfaccia UP (Attiva) ]
+  │     │     │
+  │     │     ├─► Aggiorna l'IP locale (local_ip)
+  │     │     └─► La rotta locale era dismessa/invalida?
+  │     │           ├─► SÌ: - Ripristina metrica = 1
+  │     │           │       - Azzera invalid_since
+  │     │           │       - Reinstalla rotta nel kernel (Netlink)
+  │     │           │       - Segna: table_changed = 1
+  │     │           └─► NO: Nessuna azione necessaria
+  │     │
+  │     └─► [ CASO 2: Interfaccia DOWN (Inattiva) ]
+  │           │
+  │           ├─► 1. Gestione Rotte Dipendenti:
+  │           │      Scorre il database RIP alla ricerca di rotte dinamiche
+  │           │      il cui next-hop risiede sulla subnet dell'interfaccia down.
+  │           │      Per ciascuna rotta trovata:
+  │           │        - Rimuove rotta dal kernel
+  │           │        - Avvelena la rotta (metrica = 16)
+  │           │        - Imposta invalid_since = now
+  │           │        - Segna: table_changed = 1
+  │           │
+  │           └─► 2. Gestione Rotta Locale:
+  │                  La rotta directly connected è ancora valida?
+  │                    ├─► SÌ: - Avvelena rotta locale (metrica = 16)
+  │                    │       - Rimuove rotta dal kernel
+  │                    │       - Imposta invalid_since = now
+  │                    │       - Segna: table_changed = 1
+  │                    └─► NO: Già avvelenata in precedenza
+  │
+  └─► Controllo finale: table_changed == 1 ?
+        ├─► SÌ: Invia Triggered Update via multicast (send_unsolicited_update)
+        └─► NO: Nessun pacchetto inviato
+
+[Ritorna table_changed]*/
 int refresh_local_interface_routes(int sock)
 {
     int table_changed = 0;
@@ -413,14 +470,36 @@ int refresh_local_interface_routes(int sock)
         int iface_up = interface_is_up(networks[iface_idx].interface_name, &current_ip);
         struct route_entry *route = find_route(networks[iface_idx].network, networks[iface_idx].netmask);
 
-        if (route == NULL || !route->is_local)
-            continue;
-
+        // interfaccia è attiva (UP) -> ripristina la rotta locale se era dismessa
         if (iface_up)
         {
             networks[iface_idx].local_ip = current_ip.s_addr;
 
-            if (route->metric != 1 || route->invalid_since != 0)
+            // Se nel frattempo questa rete è stata appresa via RIP (fallback),
+            // quando l'interfaccia locale torna up preferiamo nuovamente la rotta diretta.
+            if (route != NULL && !route->is_local)
+            {
+                struct in_addr net_addr;
+                char net_str[INET_ADDRSTRLEN];
+
+                route->next_hop = inet_addr("0.0.0.0");
+                route->metric = 1;
+                route->is_local = 1;
+                route->invalid_since = 0;
+                route->last_update = now;
+                strncpy(route->interface_name, networks[iface_idx].interface_name, IF_NAMESIZE - 1);
+                route->interface_name[IF_NAMESIZE - 1] = '\0';
+                table_changed = 1;
+
+                net_addr.s_addr = route->network;
+                inet_ntop(AF_INET, &net_addr, net_str, INET_ADDRSTRLEN);
+                printf("[LINK] Interface %s is up, preferring local route again for %s/%d\n", networks[iface_idx].interface_name, net_str, mask_to_prefix(route->subnet_mask));
+
+                if (add_or_replace_kernel_route(route) < 0)
+                    printf("[NETLINK] Failed to reinstall preferred local route %s\n", net_str);
+            }
+
+            if (route != NULL && route->is_local && (route->metric != 1 || route->invalid_since != 0))
             {
                 route->metric = 1;
                 route->invalid_since = 0;
@@ -438,6 +517,7 @@ int refresh_local_interface_routes(int sock)
                     printf("[NETLINK] Failed to restore local route %s\n", net_str);
             }
         }
+        // L'interfaccia è inattiva (DOWN) -> avvelena rotte dipendenti e rotta locale
         else
         {
             for (int route_idx = 0; route_idx < rip_database.num_entries; route_idx++)
@@ -468,7 +548,8 @@ int refresh_local_interface_routes(int sock)
                        networks[iface_idx].interface_name, dependent_net_str);
             }
 
-            if (route->metric != 16)
+            // avvelena la rotta direttamente connessa all'interfaccia
+            if (route != NULL && route->is_local && route->metric != 16)
             {
                 struct in_addr net_addr;
                 char net_str[INET_ADDRSTRLEN];
@@ -570,6 +651,7 @@ void graceful_shutdown(int sock)
     printf("[SHUTDOWN] Signal received, sending final poisoned update...\n");
 
     time_t now = time(NULL);
+    // avvelena tutte le rotte locali impostando la metrica a 16 (infinita)
     for (int i = 0; i < rip_database.num_entries; i++)
     {
         struct route_entry *route = &rip_database.entries[i];
@@ -581,16 +663,22 @@ void graceful_shutdown(int sock)
         }
     }
 
+    // Notifica immediata ai router vicini della disconnessione
     send_unsolicited_update(sock);
 
+    // Ripristino dello stato: rimozione dal kernel solo delle rotte dinamiche RIP
+    // (le rotte locali devono restare per mantenere raggiungibili i vicini diretti).
     for (int i = rip_database.num_entries - 1; i >= 0; i--)
     {
-        if (delete_kernel_route(&rip_database.entries[i]) < 0)
-            printf("[NETLINK] Failed to delete route during shutdown\n");
+        if (!rip_database.entries[i].is_local)
+        {
+            if (delete_kernel_route(&rip_database.entries[i]) < 0)
+                printf("[NETLINK] Failed to delete RIP route during shutdown\n");
+        }
         remove_route_at_index(i);
     }
 
-    printf("[SHUTDOWN] Kernel routes removed and RIP database cleared.\n");
+    printf("[SHUTDOWN] RIP routes removed from kernel, local routes preserved, and RIP database cleared.\n");
 }
 
 void send_full_table_unicast(int sock, struct sockaddr_in *requester_addr, const char *request_iface_name)
@@ -709,7 +797,7 @@ void print_routing_table(void)
     printf("=========================================================================================\n\n");
 }
 
-int process_route(uint32_t network, uint32_t netmask, uint32_t pkt_next_hop, uint32_t received_metric, const char *sender_ip)
+int process_route(uint32_t network, uint32_t netmask, uint32_t pkt_next_hop, uint32_t received_metric, const char *sender_ip, const char *sender_iface)
 {
     // calcolo della nuova metrica (costo + 1)
     uint32_t new_metric = received_metric + 1;
@@ -732,8 +820,9 @@ int process_route(uint32_t network, uint32_t netmask, uint32_t pkt_next_hop, uin
     {
         if (new_metric < 16)
         {
-            // interface_name "RIP" per capire che è dinamica. is_local = 0.
-            add_route(network, netmask, actual_next_hop, new_metric, "RIP", 0);
+            // Memorizziamo anche l'interfaccia da cui abbiamo appreso la rotta.
+            add_route(network, netmask, actual_next_hop, new_metric,
+                      (sender_iface != NULL && sender_iface[0] != '\0') ? sender_iface : "RIP", 0);
 
             struct in_addr net_addr;
             net_addr.s_addr = network;
@@ -751,13 +840,25 @@ int process_route(uint32_t network, uint32_t netmask, uint32_t pkt_next_hop, uin
     else
     {
         // se locale non va toccata
-        if (existing_route->is_local == 1)
-            return 0;
+        // if (existing_route->is_local == 1)
+        //   return 0;
 
         // controllo se arriva dallo stesso router da cui l'avevamo imparata
         // si aggiorna sempre (reset timer e metrica) anche se la rotta è peggiorata
         if (existing_route->next_hop == actual_next_hop)
         {
+            // Se una rotta locale è stata avvelenata (link down) e ora rientra via RIP,
+            // la convertiamo a dinamica prima dell'update kernel.
+            if (existing_route->is_local && existing_route->metric >= 16 && new_metric < 16)
+            {
+                existing_route->is_local = 0;
+                if (sender_iface != NULL && sender_iface[0] != '\0')
+                {
+                    strncpy(existing_route->interface_name, sender_iface, IF_NAMESIZE - 1);
+                    existing_route->interface_name[IF_NAMESIZE - 1] = '\0';
+                }
+            }
+
             if (existing_route->metric != new_metric)
             {
                 struct in_addr net_addr;
@@ -794,6 +895,19 @@ int process_route(uint32_t network, uint32_t netmask, uint32_t pkt_next_hop, uin
         {
             struct in_addr net_addr;
             net_addr.s_addr = network;
+
+            // Caso speciale: una rotta locale è stata avvelenata (metrica 16) per link down.
+            // Se arriva una alternativa migliore, la promuoviamo a rotta RIP via next-hop remoto.
+            if (existing_route->is_local && existing_route->metric >= 16 && new_metric < 16)
+            {
+                existing_route->is_local = 0;
+                if (sender_iface != NULL && sender_iface[0] != '\0')
+                {
+                    strncpy(existing_route->interface_name, sender_iface, IF_NAMESIZE - 1);
+                    existing_route->interface_name[IF_NAMESIZE - 1] = '\0';
+                }
+            }
+
             printf("[RIP] Route IMPROVED for %s via %s (Metric: %u -> %u)\n",
                    inet_ntoa(net_addr), sender_ip, existing_route->metric, new_metric);
 
@@ -801,6 +915,11 @@ int process_route(uint32_t network, uint32_t netmask, uint32_t pkt_next_hop, uin
             existing_route->metric = new_metric;
             existing_route->last_update = time(NULL);
             existing_route->invalid_since = 0;
+            if (sender_iface != NULL && sender_iface[0] != '\0')
+            {
+                strncpy(existing_route->interface_name, sender_iface, IF_NAMESIZE - 1);
+                existing_route->interface_name[IF_NAMESIZE - 1] = '\0';
+            }
             route_changed = 1;
 
             // aggiornamento routing table dell'host
@@ -827,6 +946,20 @@ void process_rip_packet(int sock, struct rip_packet *pkt, int bytes_received, st
     // Estraiamo l'IP per i log
     char sender_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(sender_addr->sin_addr), sender_ip, INET_ADDRSTRLEN);
+
+    char sender_iface[IF_NAMESIZE] = "";
+    for (int i = 0; i < num_networks; i++)
+    {
+        if (networks[i].interface_name[0] == '\0')
+            continue;
+
+        if (ip_in_network(sender_addr->sin_addr.s_addr, networks[i].network, networks[i].netmask))
+        {
+            strncpy(sender_iface, networks[i].interface_name, IF_NAMESIZE - 1);
+            sender_iface[IF_NAMESIZE - 1] = '\0';
+            break;
+        }
+    }
 
     // command = 1; REQUEST
     if (pkt->command == 1)
@@ -911,7 +1044,7 @@ void process_rip_packet(int sock, struct rip_packet *pkt, int bytes_received, st
 
                 if (metric > 0 && metric <= 16)
                 {
-                    if (process_route(network, netmask, next_hop, metric, sender_ip))
+                    if (process_route(network, netmask, next_hop, metric, sender_ip, sender_iface))
                     {
                         any_route_changed = 1;
                     }

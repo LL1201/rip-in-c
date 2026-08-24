@@ -35,6 +35,7 @@ int main()
     // buffering disabilitato per leggere i log tramite il comando docker logs
     setvbuf(stdout, NULL, _IONBF, 0);
 
+    // gestione dei segnali di terminazione
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     action.sa_handler = handle_shutdown_signal;
