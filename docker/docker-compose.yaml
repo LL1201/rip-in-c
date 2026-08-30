@@ -54,7 +54,7 @@ services:
     #  rip-in-c-ac-net:
     #    ipv4_address: 10.12.4.2
     volumes:
-      - ../configs/router-A.conf:/app/router.conf
+      - ./router-configs/router-A.conf:/app/router.conf
     sysctls:
       - net.ipv4.ip_forward=1 # ABILITA IL ROUTING DI LINUX
     cap_add:
@@ -73,7 +73,7 @@ services:
       rip-in-c-bc-net:
         ipv4_address: 10.12.2.2
     volumes:
-      - ../configs/router-B.conf:/app/router.conf
+      - ./router-configs/router-B.conf:/app/router.conf
     sysctls:
       - net.ipv4.ip_forward=1
     cap_add:
@@ -94,7 +94,7 @@ services:
       #rip-in-c-ac-net:
         #ipv4_address: 10.12.4.3      
     volumes:
-      - ../configs/router-C.conf:/app/router.conf
+      - ./router-configs/router-C.conf:/app/router.conf
     sysctls:
       - net.ipv4.ip_forward=1
     cap_add:
