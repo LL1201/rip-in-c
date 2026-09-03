@@ -17,7 +17,7 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 
-#define CONFIG_FILE "/app/router.conf"
+#define CONFIG_FILE "./router.conf"
 
 // Global network configuration
 struct network_config networks[MAX_NETWORKS];

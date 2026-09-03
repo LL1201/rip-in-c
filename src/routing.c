@@ -15,7 +15,7 @@
 #include <net/if.h>
 #include <linux/rtnetlink.h>
 
-#define CONFIG_FILE "/app/router.conf"
+#define CONFIG_FILE "./router.conf"
 
 struct routing_table rip_database;
 
