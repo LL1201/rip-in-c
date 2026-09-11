@@ -785,7 +785,9 @@ void print_routing_table(void)
         inet_ntop(AF_INET, &hop, hop_str, INET_ADDRSTRLEN);
 
         // Calcoliamo da quanti secondi la rotta non viene aggiornata
-        int age = (int)difftime(now, entry->last_update);
+        int age = 0;
+        if (!entry->is_local)
+            age = (int)difftime(now, entry->last_update);
 
         // Etichetta visiva per distinguere subito le nostre interfacce da quelle imparate
         char *type = entry->is_local ? "Local" : "RIP";

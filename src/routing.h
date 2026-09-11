@@ -8,7 +8,7 @@
 #include "rip-protocol-specs.h"
 
 #define MAX_ROUTING_TABLE_ENTRIES 100
-#define ROUTE_TIMEOUT 60            // per dimostrazione lo abbasso
+#define ROUTE_TIMEOUT 60            // per dimostrazione è abbassato
 #define GARBAGE_COLLECTION_TIMER 40 // Tempo di garbage collection dopo poison della metrica a 16
 
 // Internal routing table entry for RIP
@@ -24,14 +24,13 @@ struct route_entry
     int is_local;                     // 1 if directly connected, 0 if learned from RIP
 };
 
-// Routing table structure
 struct routing_table
 {
     struct route_entry entries[MAX_ROUTING_TABLE_ENTRIES];
     int num_entries;
 };
 
-// Rip routing table
+// extern indica che la variabile è definita in un altro file .c, ma può essere usata dai file che includono routing.h
 extern struct routing_table rip_database;
 
 void send_unsolicited_update(int sock);
@@ -47,8 +46,6 @@ void process_rip_packet(int sock, struct rip_packet *pkt, int bytes_received, st
 // Routing table management functions
 void init_rip_database(void);
 void add_route(uint32_t network, uint32_t subnet_mask, uint32_t next_hop, uint32_t metric, const char *interface_name, int is_local);
-// void update_route(uint32_t network, uint32_t subnet_mask, uint32_t next_hop, uint32_t metric);
-// void remove_route(uint32_t network, uint32_t subnet_mask);
 struct route_entry *find_route(uint32_t network, uint32_t subnet_mask);
 void print_routing_table(void);
 

@@ -59,7 +59,6 @@ services:
       - net.ipv4.ip_forward=1 # ABILITA IL ROUTING DI LINUX
     cap_add:
       - NET_ADMIN
-    command: tail -f /dev/null
 
   # --- ROUTER B ---
   router_b:
@@ -78,7 +77,6 @@ services:
       - net.ipv4.ip_forward=1
     cap_add:
       - NET_ADMIN
-    command: tail -f /dev/null
 
   # --- ROUTER C ---
   router_c:
@@ -99,7 +97,6 @@ services:
       - net.ipv4.ip_forward=1
     cap_add:
       - NET_ADMIN
-    command: tail -f /dev/null
 
   # --- CLIENT rete CY ---
   client_cy:

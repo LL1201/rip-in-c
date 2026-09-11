@@ -13,15 +13,20 @@
 
 #define BASE_UPDATE_TIMER 10
 
+// permette un accesso atomico anche in presenza di interrupt asincroni
 static volatile sig_atomic_t shutdown_requested = 0;
 
+// Per poter essere registrata tramite signal() o sigaction()
+// la funzione deve rispettare rigidamente una determinata firma
+// accettare un parametro intero
 static void handle_shutdown_signal(int signal_number)
 {
+    // silenzia i warning di variabile non utilizzata
     (void)signal_number;
     shutdown_requested = 1;
 }
 
-// funzione helper per calcolare il timer con jitter (30 sec +/- 5)
+// funzione helper per calcolare il timer con jitter (30 sec +- 5)
 int get_jittered_timer()
 {
     // rand() % 11 genera un numero tra 0 e 10.
@@ -45,7 +50,6 @@ int main()
 
     printf("RIPinC Daemon starting...\n");
 
-    // Create UDP Multicast socket
     int sock = create_rip_socket();
     if (sock < 0)
     {
@@ -69,7 +73,6 @@ int main()
     init_rip_database();
     print_routing_table();
 
-    // Variables for select()
     fd_set readfds;
     struct timeval tv, now, next_update;
 
