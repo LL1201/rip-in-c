@@ -1,5 +1,4 @@
-#define _DEFAULT_SOURCE
-#define _BSD_SOURCE
+#define _DEFAULT_SOURCE // necessario per getifaddrs() e if_nametoindex()
 
 #include "network.h"
 #include "rip-protocol-specs.h"
@@ -73,7 +72,7 @@ static int interface_has_carrier(const char *interface_name)
 
     fclose(f);
 
-    // "up" significa carrier presente; gli altri stati li trattiamo come down.
+    // "up" significa carrier presente; gli altri stati li tratto come down.
     return (strncmp(state, "up", 2) == 0);
 }
 

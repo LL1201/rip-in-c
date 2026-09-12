@@ -9,7 +9,6 @@
 
 #define MAX_NETWORKS 10
 
-// Structure to hold network CIDR
 struct network_config
 {
     uint32_t network; // Network address
@@ -18,7 +17,7 @@ struct network_config
     uint32_t local_ip; // L'IP fisico della scheda
 };
 
-// Exposed network configuration
+// Permette ai file che importano network.h di usare networks
 extern struct network_config networks[MAX_NETWORKS];
 extern int num_networks;
 

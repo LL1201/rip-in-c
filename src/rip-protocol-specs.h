@@ -18,8 +18,8 @@ struct rip_rte
 
 struct rip_packet
 {
-    uint8_t command; // 1=Request, 2=Response
-    uint8_t version; // 2
+    uint8_t command; // 1 = Request, 2 = Response
+    uint8_t version;
     uint16_t must_be_zero;
     struct rip_rte entries[25];
 } __attribute__((packed));

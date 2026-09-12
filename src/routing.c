@@ -1,5 +1,4 @@
-#define _DEFAULT_SOURCE
-#define _BSD_SOURCE
+#define _DEFAULT_SOURCE // necessario per getifaddrs() e if_nametoindex()
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -271,8 +270,7 @@ static int delete_kernel_route(struct route_entry *route)
         !route->is_local);
 }
 
-// Con le veth il peer può andare giù e lasciare la scheda ancora "UP" dal punto di vista amministrativo.
-// Per questo leggiamo operstate da sysfs e consideriamo attiva solo una scheda che riporta "up".
+// Leggendo operstate da sysfs considero attiva solo una scheda che riporta "up".
 static int interface_has_carrier(const char *interface_name)
 {
     char path[256];

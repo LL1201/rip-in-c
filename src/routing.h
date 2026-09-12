@@ -11,7 +11,7 @@
 #define ROUTE_TIMEOUT 60            // per dimostrazione è abbassato
 #define GARBAGE_COLLECTION_TIMER 40 // Tempo di garbage collection dopo poison della metrica a 16
 
-// Internal routing table entry for RIP
+// Internal routing table entry
 struct route_entry
 {
     uint32_t network;                 // Network address
