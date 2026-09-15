@@ -33,7 +33,7 @@ void init_routing_netlink_socket(int nl_sock)
 }
 
 // Aggiunge un attributo alla fine del messaggio netlink *n.
-// Questa funzione è piccola apposta: fa solo il controllo degli spazi.
+// fa solo il controllo degli spazi.
 // int type: Il tipo di attributo da inserire (es. RTA_GATEWAY, RTA_DST, RTA_OIF).
 // int alen: Lunghezza in byte dei soli dati puntati da data.
 static int netlink_add_attribute(struct nlmsghdr *n, int maxlen, int type, const void *data, int alen)
