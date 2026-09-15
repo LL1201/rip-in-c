@@ -13,12 +13,13 @@
 
 #define BASE_UPDATE_TIMER 10
 
-// permette un accesso atomico anche in presenza di interrupt asincroni
+// sig_atomic_t permette un accesso atomico anche in presenza di interrupt asincroni
+// volatile ordina al compilatore di non ottimizzare nulla per questa variabile
 static volatile sig_atomic_t shutdown_requested = 0;
 
 // Per poter essere registrata tramite signal() o sigaction()
-// la funzione deve rispettare rigidamente una determinata firma
-// accettare un parametro intero
+// la funzione deve rispettare una determinata firma
+// accettando un parametro intero
 static void handle_shutdown_signal(int signal_number)
 {
     // silenzia i warning di variabile non utilizzata
@@ -161,7 +162,7 @@ int main()
         else if (activity > 0 && FD_ISSET(nl_sock, &readfds))
         {
             // Il kernel ci ha avvisato che un link è cambiato.
-            // Non facciamo parsing complicato: svuotiamo la coda e rieseguiamo il refresh.
+            // Si scuota la coda e rieseguiamo il refresh.
             if (handle_netlink_link_events(nl_sock))
             {
                 refresh_local_interface_routes(sock);

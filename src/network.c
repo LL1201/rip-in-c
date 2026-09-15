@@ -130,6 +130,9 @@ int create_netlink_socket()
     return sock;
 }
 
+// svuota la coda dei messaggi Netlink inviati dal kernel e segnala se lo stato fisico
+// o logico di una scheda di rete è cambiato
+// Restituisce 1 se c'è stato almeno un evento di cambio link
 int handle_netlink_link_events(int nl_sock)
 {
     char buffer[4096];
@@ -137,6 +140,8 @@ int handle_netlink_link_events(int nl_sock)
 
     while (1)
     {
+        // chiamata non bloccante con MSG_DONTWAIT
+        // se non ci sono notifiche pendenti nel socket non blocca l'esecuzione
         ssize_t len = recv(nl_sock, buffer, sizeof(buffer), MSG_DONTWAIT);
         if (len < 0)
         {
@@ -150,8 +155,10 @@ int handle_netlink_link_events(int nl_sock)
         if (len == 0)
             break;
 
+        // scorrimento messaggi nel buffer
         for (struct nlmsghdr *nlh = (struct nlmsghdr *)buffer; NLMSG_OK(nlh, (unsigned int)len); nlh = NLMSG_NEXT(nlh, len))
         {
+            // Rilevamento di eventi sulle interfacce
             if (nlh->nlmsg_type == RTM_NEWLINK || nlh->nlmsg_type == RTM_DELLINK || nlh->nlmsg_type == RTM_SETLINK)
                 saw_link_event = 1;
         }
