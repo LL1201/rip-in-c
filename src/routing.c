@@ -218,7 +218,7 @@ static int netlink_update_route(int nlmsg_type, uint32_t network, uint32_t subne
 static int mask_to_prefix(uint32_t mask)
 {
     int prefix = 0;
-    uint32_t m = ntohl(mask);
+    uint32_t m = ntohl(mask); // converte il numero nell 'ordine dei byte nativo dell' architettura della macchina
 
     while (m & 0x80000000)
     {
