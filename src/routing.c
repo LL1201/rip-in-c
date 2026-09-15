@@ -32,13 +32,16 @@ void init_routing_netlink_socket(int nl_sock)
     routing_netlink_sock = nl_sock;
 }
 
-// Aggiunge un attributo alla fine del messaggio netlink.
+// Aggiunge un attributo alla fine del messaggio netlink *n.
 // Questa funzione è piccola apposta: fa solo il controllo degli spazi.
+// int type: Il tipo di attributo da inserire (es. RTA_GATEWAY, RTA_DST, RTA_OIF).
+// int alen: Lunghezza in byte dei soli dati puntati da data.
 static int netlink_add_attribute(struct nlmsghdr *n, int maxlen, int type, const void *data, int alen)
 {
     int len = RTA_LENGTH(alen);
     struct rtattr *rta;
 
+    // Controllo dei limiti del buffer
     if (NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(len) > (unsigned int)maxlen)
     {
         fprintf(stderr, "[NETLINK] add_attribute failed: maxlen=%d\n", maxlen);
@@ -62,9 +65,9 @@ static int netlink_send_route_request(int sock, int cmd, int flags, uint32_t dst
 {
     struct
     {
-        struct nlmsghdr n;
-        struct rtmsg r;
-        char buf[4096];
+        struct nlmsghdr n; // Header generico Netlink
+        struct rtmsg r;    // Header specifico per operazioni di routing
+        char buf[4096];    // Spazio per gli attributi opzionali
     } request;
 
     memset(&request, 0, sizeof(request));
@@ -92,7 +95,7 @@ static int netlink_send_route_request(int sock, int cmd, int flags, uint32_t dst
     {
         if (netlink_add_attribute(&request.n, sizeof(request), RTA_GATEWAY, &gw, sizeof(gw)) < 0)
             return -1;
-        request.r.rtm_scope = RT_SCOPE_UNIVERSE;
+        request.r.rtm_scope = RT_SCOPE_UNIVERSE; // significa che la destinazione è fuori dalla subnet locale, raggiungibile con più hop
     }
 
     // Destinazione della rotta.
@@ -197,6 +200,7 @@ static int netlink_update_route(int nlmsg_type, uint32_t network, uint32_t subne
     if (nlmsg_type == RTM_NEWROUTE)
         flags = NLM_F_CREATE | NLM_F_REPLACE;
 
+    // Il kernel non usa nomi testuali come "eth0" o "wlan0" all'interno dei messaggi Netlink ma identificatori numerici univoci
     if (interface_name != NULL && interface_name[0] != '\0')
     {
         if_idx = (int)if_nametoindex(interface_name);
@@ -210,7 +214,6 @@ static int netlink_update_route(int nlmsg_type, uint32_t network, uint32_t subne
     return netlink_send_route_request(routing_netlink_sock, nlmsg_type, flags, network, (uint8_t)mask_to_prefix(subnet_mask), gateway, use_gateway, if_idx, metric);
 }
 
-// new
 //  Helper: Convert subnet mask to CIDR prefix length
 static int mask_to_prefix(uint32_t mask)
 {
