@@ -36,19 +36,21 @@ void init_routing_netlink_socket(int nl_sock)
 // fa solo il controllo degli spazi.
 // int type: Il tipo di attributo da inserire (es. RTA_GATEWAY, RTA_DST, RTA_OIF).
 // int alen: Lunghezza in byte dei soli dati puntati da data.
+// *data puntatore ai dati da inserire
 static int netlink_add_attribute(struct nlmsghdr *n, int maxlen, int type, const void *data, int alen)
 {
     int len = RTA_LENGTH(alen);
     struct rtattr *rta;
 
     // Controllo dei limiti del buffer
+    // NLMSG_ALIGN e RTA_ALIGN arrotondano per eccesso la lunghezza del messaggio
     if (NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(len) > (unsigned int)maxlen)
     {
         fprintf(stderr, "[NETLINK] add_attribute failed: maxlen=%d\n", maxlen);
         return -1;
     }
 
-    rta = NLMSG_TAIL(n);
+    rta = NLMSG_TAIL(n); // macro che restituisce un puntatore al primo byte libero in coda al messaggio attuale
     rta->rta_type = type;
     rta->rta_len = len;
 
@@ -121,8 +123,9 @@ static int netlink_send_route_request(int sock, int cmd, int flags, uint32_t dst
     memset(&kernel_addr, 0, sizeof(kernel_addr));
     kernel_addr.nl_family = AF_NETLINK;
 
+    // operazioni di I/O vettorizzate
     struct iovec iov = {
-        .iov_base = &request.n,
+        .iov_base = &request.n, // Puntatore all'inizio del buffer di memoria.
         .iov_len = request.n.nlmsg_len,
     };
 
