@@ -123,9 +123,9 @@ static int netlink_send_route_request(int sock, int cmd, int flags, uint32_t dst
     memset(&kernel_addr, 0, sizeof(kernel_addr));
     kernel_addr.nl_family = AF_NETLINK;
 
-    // operazioni di I/O vettorizzate
+    // per le operazioni di I/O vettorizzate
     struct iovec iov = {
-        .iov_base = &request.n, // Puntatore all'inizio del buffer di memoria.
+        .iov_base = &request.n, // Puntatore all'inizio del buffer di memoria
         .iov_len = request.n.nlmsg_len,
     };
 
